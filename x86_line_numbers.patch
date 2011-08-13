@@ -1,0 +1,24 @@
+--- crash-5.0.0/gdb-7.0.patch.orig
++++ crash-5.0.0/gdb-7.0.patch
+@@ -1260,3 +1260,21 @@
+  	./pex-djgpp.o ./pex-msdos.o					\
+  	 ./pex-unix.o ./pex-win32.o					\
+  	 ./putenv.o							\
++--- gdb-7.0/gdb/symtab.c.orig
+++++ gdb-7.0/gdb/symtab.c
++@@ -867,6 +867,7 @@ find_pc_sect_psymtab (CORE_ADDR pc, stru
++   /* Try just the PSYMTABS_ADDRMAP mapping first as it has better granularity
++      than the later used TEXTLOW/TEXTHIGH one.  */
++ 
+++#ifndef __i386__
++   ALL_OBJFILES (objfile)
++     if (objfile->psymtabs_addrmap != NULL)
++       {
++@@ -901,6 +902,7 @@ find_pc_sect_psymtab (CORE_ADDR pc, stru
++ 	    return pst;
++ 	  }
++       }
+++#endif
++ 
++   /* Existing PSYMTABS_ADDRMAP mapping is present even for PARTIAL_SYMTABs
++      which still have no corresponding full SYMTABs read.  But it is not

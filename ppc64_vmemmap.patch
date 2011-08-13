@@ -1,0 +1,269 @@
+--- crash-5.0.0/ppc64.c.orig
++++ crash-5.0.0/ppc64.c
+@@ -51,6 +51,7 @@ static void ppc64_print_eframe(char *, s
+ static void parse_cmdline_args(void);
+ static void ppc64_paca_init(void);
+ static void ppc64_clear_machdep_cache(void);
++static void ppc64_vmemmap_init(void);
+ 
+ struct machine_specific ppc64_machine_specific = { { 0 }, 0, 0 };
+ 
+@@ -137,8 +138,11 @@ ppc64_init(int when)
+ 		machdep->line_number_hooks = ppc64_line_number_hooks;
+ 		machdep->value_to_symbol = generic_machdep_value_to_symbol;
+ 		machdep->init_kernel_pgd = NULL;
+-		if (symbol_exists("vmemmap_populate"))
++		if (symbol_exists("vmemmap_populate")) {
+ 			machdep->flags |= VMEMMAP;
++			machdep->machspec->vmemmap_base = 
++				VMEMMAP_REGION_ID << REGION_SHIFT;
++		}
+ 		break;
+ 
+ 	case POST_GDB:
+@@ -190,6 +194,9 @@ ppc64_init(int when)
+ 			m->l4_shift = m->l3_shift + m->l3_index_size;
+ 		}
+ 
++		if (machdep->flags & VMEMMAP)
++			ppc64_vmemmap_init();
++
+ 		machdep->section_size_bits = _SECTION_SIZE_BITS;
+ 		machdep->max_physmem_bits = _MAX_PHYSMEM_BITS;
+ 		ppc64_paca_init();
+@@ -328,6 +335,8 @@ ppc64_dump_machdep_table(ulong arg)
+ 		fprintf(fp, "%sVM_4_LEVEL", others++ ? "|" : "");
+ 	if (machdep->flags & VMEMMAP)
+ 		fprintf(fp, "%sVMEMMAP", others++ ? "|" : "");
++	if (machdep->flags & VMEMMAP_AWARE)
++		fprintf(fp, "%sVMEMMAP_AWARE", others++ ? "|" : "");
+         fprintf(fp, ")\n");
+ 
+ 	fprintf(fp, "             kvbase: %lx\n", machdep->kvbase);
+@@ -419,6 +428,27 @@ ppc64_dump_machdep_table(ulong arg)
+ 	fprintf(fp, "             l1_shift: %d\n", machdep->machspec->l1_shift);
+ 	fprintf(fp, "            pte_shift: %d\n", machdep->machspec->pte_shift);
+ 	fprintf(fp, "       l2_masked_bits: %x\n", machdep->machspec->l2_masked_bits);
++	fprintf(fp, "         vmemmap_base: "); 
++	if (machdep->machspec->vmemmap_base)
++		fprintf(fp, "%lx\n", machdep->machspec->vmemmap_base);
++	else
++		fprintf(fp, "(unused)\n");
++	if (machdep->machspec->vmemmap_cnt) {
++		fprintf(fp, "          vmemmap_cnt: %d\n", 
++			machdep->machspec->vmemmap_cnt);
++		fprintf(fp, "        vmemmap_psize: %d\n", 
++			machdep->machspec->vmemmap_psize);
++		for (i = 0; i < machdep->machspec->vmemmap_cnt; i++) {
++			fprintf(fp, 
++			    "      vmemmap_list[%d]: virt: %lx  phys: %lx\n", i, 
++				machdep->machspec->vmemmap_list[i].virt,
++				machdep->machspec->vmemmap_list[i].phys);
++		}
++	} else {
++		fprintf(fp, "          vmemmap_cnt: (unused)\n");
++		fprintf(fp, "    vmemmap_page_size: (unused)\n");
++		fprintf(fp, "       vmemmap_list[]: (unused)\n");
++	}
+ }
+ 
+ /*
+@@ -653,7 +683,8 @@ ppc64_kvtop(struct task_context *tc, ulo
+         if (!IS_KVADDR(kvaddr))
+                 return FALSE;
+ 
+-	if (REGION_ID(kvaddr) == VMEMMAP_REGION_ID)
++	if ((machdep->flags & VMEMMAP) && 
++	    (kvaddr >= machdep->machspec->vmemmap_base))
+ 		return ppc64_vmemmap_to_phys(kvaddr, paddr, verbose);
+ 
+ 	if (!vt->vmalloc_start) {
+@@ -673,34 +704,135 @@ ppc64_kvtop(struct task_context *tc, ulo
+ }
+ 
+ /*
++ *  Verify that the kernel has made the vmemmap list available,
++ *  and if so, stash the relevant data required to make vtop
++ *  translations.
++ */
++static
++void ppc64_vmemmap_init(void)
++{
++	int i, psize, shift, cnt;
++	struct list_data list_data, *ld;
++	long backing_size, virt_addr_offset, phys_offset, list_offset;
++	ulong *vmemmap_list;
++	char *vmemmap_buf;
++	struct machine_specific *ms;
++	
++	if (!(kernel_symbol_exists("vmemmap_list")) ||
++	    !(kernel_symbol_exists("mmu_psize_defs")) ||
++	    !(kernel_symbol_exists("mmu_vmemmap_psize")) ||
++	    !STRUCT_EXISTS("vmemmap_backing") ||
++	    !STRUCT_EXISTS("mmu_psize_def") ||
++	    !MEMBER_EXISTS("mmu_psize_def", "shift") ||
++	    !MEMBER_EXISTS("vmemmap_backing", "phys") ||
++	    !MEMBER_EXISTS("vmemmap_backing", "virt_addr") ||
++	    !MEMBER_EXISTS("vmemmap_backing", "list"))
++		return;
++
++	ms = machdep->machspec;
++
++	backing_size = STRUCT_SIZE("vmemmap_backing");
++	virt_addr_offset = MEMBER_OFFSET("vmemmap_backing", "virt_addr");
++	phys_offset = MEMBER_OFFSET("vmemmap_backing", "phys");
++	list_offset = MEMBER_OFFSET("vmemmap_backing", "list");
++
++	if (!readmem(symbol_value("mmu_vmemmap_psize"),
++	    KVADDR, &psize, sizeof(int), "mmu_vmemmap_psize", 
++	    RETURN_ON_ERROR))
++		return;
++	if (!readmem(symbol_value("mmu_psize_defs") +
++	    (STRUCT_SIZE("mmu_psize_def") * psize) +
++	    MEMBER_OFFSET("mmu_psize_def", "shift"),
++	    KVADDR, &shift, sizeof(int), "mmu_psize_def shift",
++	    RETURN_ON_ERROR))
++		return;
++
++	ms->vmemmap_psize = 1 << shift;
++
++        ld =  &list_data;
++        BZERO(ld, sizeof(struct list_data));
++	if (!readmem(symbol_value("vmemmap_list")+OFFSET(list_head_next),
++	    KVADDR, &ld->start, sizeof(void *), "vmemmap_list.next",
++	    RETURN_ON_ERROR))
++		return;
++        ld->end = symbol_value("vmemmap_list");
++        ld->list_head_offset = list_offset;
++
++        hq_open();
++	cnt = do_list(ld);
++        vmemmap_list = (ulong *)GETBUF(cnt * sizeof(ulong));
++        cnt = retrieve_list(vmemmap_list, cnt);
++	hq_close();
++
++	if ((ms->vmemmap_list = (struct ppc64_vmemmap *)malloc(cnt *
++	    sizeof(struct ppc64_vmemmap))) == NULL)
++		error(FATAL, "cannot malloc vmemmap list space");
++
++        vmemmap_buf = GETBUF(backing_size);
++	for (i = 0; i < cnt; i++) {
++		if (!readmem(vmemmap_list[i], KVADDR, vmemmap_buf, 
++		   backing_size, "vmemmap_backing", RETURN_ON_ERROR))
++			goto out;
++
++		ms->vmemmap_list[i].phys = ULONG(vmemmap_buf + phys_offset);
++		ms->vmemmap_list[i].virt = ULONG(vmemmap_buf + virt_addr_offset);
++	}
++
++	if (ms->vmemmap_base != ms->vmemmap_list[0].virt) {
++		ms->vmemmap_base = ms->vmemmap_list[0].virt;
++		if (CRASHDEBUG(1))
++			fprintf(fp, 
++			    "ppc64_vmemmap_init: vmemmap base: %lx\n",
++				ms->vmemmap_base);
++	}
++
++        ms->vmemmap_cnt = cnt;
++	machdep->flags |= VMEMMAP_AWARE;
++out:
++	FREEBUF(vmemmap_buf);
++	FREEBUF(vmemmap_list);
++	machdep->flags |= VMEMMAP_AWARE;
++}
++
++/*
+  *  If the vmemmap address translation information is stored in the kernel,
+  *  make the translation. 
+  */
+ static int
+ ppc64_vmemmap_to_phys(ulong kvaddr, physaddr_t *paddr, int verbose)
+ {
+-	if (!(machdep->flags & VMEMMAP))
+-		return FALSE;
+-
+-	/*
+-	 *  If possible, make the translation here.
+-	 */
++	int i;
++	ulong offset;
++	struct machine_specific *ms;
+ 
+-		/* TBD -- kernel assist required */
++	if (!(machdep->flags & VMEMMAP_AWARE)) {
++		/*
++		 *  During runtime, just fail the command.
++		 */
++		if (vt->flags & VM_INIT)
++			error(FATAL, "cannot translate vmemmap address: %lx\n",
++				 kvaddr); 
++		/*
++		 *  During vm_init() initialization, print a warning message.
++		 */
++		error(WARNING, 
++		    "cannot translate vmemmap kernel virtual addresses:\n"
++		    "         commands requiring page structure contents"
++		    " will fail\n\n");
++	
++		return FALSE;
++	}
+ 
+-	/*
+-	 *  During runtime, just fail the command.
+-	 */
+-	if (vt->flags & VM_INIT)
+-		error(FATAL, "cannot translate vmemmap address: %lx\n",
+-			 kvaddr); 
++	ms = machdep->machspec;
+ 
+-	/*
+-	 *  During vm_init() initialization, print a warning message.
+-	 */
+-	error(WARNING, 
+-	    "cannot translate vmemmap kernel virtual addresses:\n"
+-	    "         commands requiring page structure contents will fail\n\n");
++	for (i = 0; i < ms->vmemmap_cnt; i++) {
++		if ((kvaddr >= ms->vmemmap_list[i].virt) &&
++		    (kvaddr < (ms->vmemmap_list[i].virt + ms->vmemmap_psize))) {
++			offset = kvaddr - ms->vmemmap_list[i].virt;
++			*paddr = ms->vmemmap_list[i].phys + offset;
++			return TRUE;
++		}
++	}
+ 
+ 	return FALSE;
+ }
+--- crash-5.0.0/defs.h.orig
++++ crash-5.0.0/defs.h
+@@ -3984,6 +3984,11 @@ struct ppc64_pt_regs {
+         long result;         /* Result of a system call */
+ };
+ 
++struct ppc64_vmemmap {
++        unsigned long phys;
++        unsigned long virt;
++};
++
+ /*
+  * Used to store the HW interrupt stack. It is only for 2.4.
+  */
+@@ -4010,6 +4015,11 @@ struct machine_specific {
+ 
+ 	uint pte_shift;
+ 	uint l2_masked_bits;
++
++	int vmemmap_cnt;
++	int vmemmap_psize;
++	ulong vmemmap_base;
++	struct ppc64_vmemmap *vmemmap_list;
+ };
+ 
+ #define IS_LAST_L4_READ(l4)   ((ulong)(l4) == machdep->machspec->last_level4_read)
+@@ -4027,6 +4037,7 @@ void ppc64_dump_machdep_table(ulong);
+         error(FATAL, "-d option is not applicable to PowerPC architecture\n")
+ #define KSYMS_START (0x1)
+ #define VM_ORIG     (0x2)
++#define VMEMMAP_AWARE (0x4)
+ 
+ #define REGION_SHIFT       (60UL)
+ #define REGION_ID(addr)    (((unsigned long)(addr)) >> REGION_SHIFT)

@@ -1,0 +1,60 @@
+--- crash-5.0.0/x86_64.c.orig
++++ crash-5.0.0/x86_64.c
+@@ -81,6 +81,7 @@ static void parse_cmdline_args(void);
+ static void x86_64_clear_machdep_cache(void);
+ static void x86_64_irq_eframe_link_init(void);
+ static void x86_64_framepointer_init(void);
++static void x86_64_xendump_phys_base(void);
+ static int x86_64_xendump_p2m_create(struct xendump_data *);
+ static char *x86_64_xendump_load_page(ulong, struct xendump_data *);
+ static int x86_64_xendump_page_index(ulong, struct xendump_data *);
+@@ -5339,9 +5340,49 @@ x86_64_calc_phys_base(void)
+ 				break;
+ 			}
+ 		}
++
++		x86_64_xendump_phys_base();
+ 	}
+ }
+ 
++/*
++ *  Because the xendump phys_base calculation is so speculative,
++ *  first verify and then possibly override it by trying to read
++ *  linux_banner from a range of typical physical offsets.
++ */
++static void
++x86_64_xendump_phys_base(void)
++{
++	char buf[BUFSIZE];
++	struct syment *sp;
++	ulong phys, linux_banner_phys;
++
++	if (!(sp = symbol_search("linux_banner")) ||
++	    !((sp->type == 'R') || (sp->type == 'r')))
++		return;
++
++	linux_banner_phys = sp->value - __START_KERNEL_map;
++
++	if (readmem(linux_banner_phys + machdep->machspec->phys_base,
++	    PHYSADDR, buf, strlen("Linux version"), "xendump linux_banner", 
++	    QUIET|RETURN_ON_ERROR) && STRNEQ(buf, "Linux version"))
++		return;
++
++	for (phys = (ulong)(-MEGABYTES(16)); phys != MEGABYTES(16+1); 
++	     phys += MEGABYTES(1)) {
++		if (readmem(linux_banner_phys + phys, PHYSADDR, buf,
++		    strlen("Linux version"), "xendump linux_banner", 
++		    QUIET|RETURN_ON_ERROR) && STRNEQ(buf, "Linux version")) {
++			if (CRASHDEBUG(1))
++				fprintf(fp,
++				    "xendump phys_base: %lx %s\n", phys, 
++					machdep->machspec->phys_base != phys ?
++					"override" : "");
++			machdep->machspec->phys_base = phys;
++			return;
++		}
++	}
++}
+ 
+ /*
+  *  Create an index of mfns for each page that makes up the

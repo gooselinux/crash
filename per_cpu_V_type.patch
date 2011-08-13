@@ -1,0 +1,11 @@
+--- crash-5.0.0/symbols.c.orig
++++ crash-5.0.0/symbols.c
+@@ -5247,7 +5247,7 @@ display_per_cpu_info(struct syment *sp)
+ 	if (((kt->flags & (SMP|PER_CPU_OFF)) != (SMP|PER_CPU_OFF)) ||
+ 	    (sp->value < symbol_value("__per_cpu_start")) || 
+ 	    (sp->value >= symbol_value("__per_cpu_end")) ||
+-	    !((sp->type == 'd') || (sp->type == 'D')))
++	    !((sp->type == 'd') || (sp->type == 'D') || (sp->type == 'V')))
+ 		return FALSE;
+ 
+ 	fprintf(fp, "PER-CPU DATA TYPE:\n  ");

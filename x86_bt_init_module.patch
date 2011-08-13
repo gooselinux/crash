@@ -1,0 +1,227 @@
+--- crash-5.0.0/defs.h.orig
++++ crash-5.0.0/defs.h
+@@ -1497,6 +1497,8 @@ struct offset_table {                   
+ 	long module_sections_attrs;
+ 	long swap_info_struct_inuse_pages;
+ 	long s390_lowcore_psw_save_area;
++	long module_module_init;
++	long module_init_text_size;
+ };
+ 
+ struct size_table {         /* stash of commonly-used sizes */
+@@ -2013,6 +2015,8 @@ struct load_module {
+ 	ulong mod_bss_start;
+ 	int mod_sections;
+ 	struct mod_section_data *mod_section_data;
++        ulong mod_init_text_size;
++        ulong mod_init_module_ptr;
+ };
+ 
+ #define IN_MODULE(A,L) \
+@@ -3435,6 +3439,7 @@ long OFFSET_option(long, long, char *, c
+ long SIZE_option(long, long, char *, char *, int, char *, char *);
+ void dump_trace(void **);
+ int enumerator_value(char *, long *);
++struct load_module *init_module_function(ulong);
+ 
+ /*  
+  *  memory.c 
+--- crash-5.0.0/symbols.c.orig
++++ crash-5.0.0/symbols.c
+@@ -1315,12 +1315,19 @@ store_module_symbols_v2(ulong total, int
+ 				ngplsyms, nksyms);
+ 		lm->mod_flags = MOD_EXT_SYMS;
+ 		lm->mod_ext_symcnt = mcnt;
+-		if (THIS_KERNEL_VERSION >= LINUX(2,6,27))
++		lm->mod_init_module_ptr = ULONG(modbuf + 
++			OFFSET(module_module_init));
++		if (THIS_KERNEL_VERSION >= LINUX(2,6,27)) {
+ 			lm->mod_etext_guess = lm->mod_base +
+ 				UINT(modbuf + OFFSET(module_core_text_size));
+-		else
++			lm->mod_init_text_size = 
++				UINT(modbuf + OFFSET(module_init_text_size));
++		} else {
+ 			lm->mod_etext_guess = lm->mod_base +
+ 				ULONG(modbuf + OFFSET(module_core_text_size));
++			lm->mod_init_text_size = 
++				ULONG(modbuf + OFFSET(module_init_text_size));
++		}
+ 		lm->mod_text_start = lm->mod_base;
+ 
+ 		st->ext_module_symtable[mcnt].value = lm->mod_base;
+@@ -2504,6 +2511,10 @@ dump_symbol_table(void)
+                         lm->mod_bss_start,
+                         lm->mod_bss_start ?
+                         lm->mod_bss_start - lm->mod_base : 0);
++		fprintf(fp, "    mod_init_text_size: %ld\n",
++			lm->mod_init_text_size);
++		fprintf(fp, "   mod_init_module_ptr: %lx\n",
++			lm->mod_init_module_ptr);
+ 
+ 		fprintf(fp, "          mod_sections: %d\n", lm->mod_sections);
+ 		fprintf(fp, "      mod_section_data: %lx %s\n",
+@@ -6451,6 +6462,10 @@ dump_offset_table(char *spec, ulong make
+ 		OFFSET(module_core_size));
+ 	fprintf(fp, "         module_core_text_size: %ld\n",
+ 		OFFSET(module_core_text_size));
++	fprintf(fp, "         module_init_text_size: %ld\n",
++		OFFSET(module_init_text_size));
++	fprintf(fp, "            module_module_init: %ld\n",
++		OFFSET(module_module_init));
+ 	fprintf(fp, "             module_num_symtab: %ld\n",
+ 		OFFSET(module_num_symtab));
+ 	fprintf(fp, "                 module_symtab: %ld\n",
+@@ -9749,3 +9764,32 @@ get_thisfile(void)
+ 
+ 	return pc->program_path;
+ }
++
++/*
++ *  Check whether an address fits into any existing init_module() functions,
++ *  and if so, return the load_module.
++ */
++struct load_module *
++init_module_function(ulong vaddr)
++{
++	int i;
++	struct load_module *lm;
++
++	if (((kt->flags & (KMOD_V1|KMOD_V2)) == KMOD_V1) ||
++	    INVALID_MEMBER(module_init_text_size) ||
++	    INVALID_MEMBER(module_module_init))
++		return NULL;
++
++        for (i = 0; i < st->mods_installed; i++) {
++                lm = &st->load_modules[i];
++		if (!lm->mod_init_module_ptr || !lm->mod_init_text_size)
++			continue;
++
++		if ((vaddr >= lm->mod_init_module_ptr) &&
++		    (vaddr < (lm->mod_init_module_ptr+lm->mod_init_text_size)) 
++		    && accessible(vaddr))
++			return lm;
++	}
++
++	return NULL;
++}
+--- crash-5.0.0/kernel.c.orig
++++ crash-5.0.0/kernel.c
+@@ -2664,6 +2664,9 @@ module_init(void)
+ 			"core_size");
+         	MEMBER_OFFSET_INIT(module_core_text_size, "module", 
+ 			"core_text_size");
++		MEMBER_OFFSET_INIT(module_module_init, "module", "module_init");
++		MEMBER_OFFSET_INIT(module_init_text_size, "module", 
++			"init_text_size");
+ 
+ 		/*
+ 		 *  Make sure to pick the kernel "modules" list_head symbol,
+--- crash-5.0.0/lkcd_x86_trace.c.orig
++++ crash-5.0.0/lkcd_x86_trace.c
+@@ -127,6 +127,7 @@ kl_funcname(kaddr_t pc)
+ {
+         struct syment *sp;
+ 	char *buf, *name;
++	struct load_module *lm;
+ 
+ 	if ((sp = value_search(pc, NULL))) {
+ 		if (STREQ(sp->name, "_stext") &&
+@@ -159,6 +160,9 @@ kl_funcname(kaddr_t pc)
+ 		}
+ 	}
+ 
++	if ((lm = init_module_function(pc))) 
++		return ("init_module");
++ 
+        	return NULL;
+ }
+ 
+@@ -166,6 +170,7 @@ static kaddr_t
+ kl_funcaddr(kaddr_t pc)
+ {
+ 	struct syment *sp;
++	struct load_module *lm;
+ 
+         if ((sp = value_search(pc, NULL))) {
+                 switch (sp->type)
+@@ -182,16 +187,33 @@ kl_funcaddr(kaddr_t pc)
+                 if (is_kernel_text(pc))
+                         return sp->value;
+         }
++
++	if ((lm = init_module_function(pc)))
++		return lm->mod_init_module_ptr;
++
+         return((kaddr_t)NULL);
+ }
+ 
++static struct syment init_module_syment = {
++	.name = "init_module",
++	.type = 't',
++};
++
+ static syment_t *
+ kl_lkup_symaddr(kaddr_t addr)
+ {
+         struct syment *sp;
++	struct load_module *lm;
++
++        if ((sp = value_search(addr, NULL)))
++		return sp;
++
++	if ((lm = init_module_function(addr))) {
++		init_module_syment.value = lm->mod_init_module_ptr;
++		return &init_module_syment;
++	}
+ 
+-        sp = value_search(addr, NULL); 
+-	return sp;
++	return NULL;
+ }
+ 
+ static k_error_t
+@@ -600,7 +622,7 @@ static int
+ dump_framesize_cache(FILE *ofp, struct framesize_cache *fcp)
+ {
+         int i, count;
+-        struct syment *sp;
++        struct syment *sp, *spm;
+ 	ulong offset;
+ 	int once;
+ 
+@@ -625,8 +647,14 @@ dump_framesize_cache(FILE *ofp, struct f
+ 			framesize_cache[i].bp_adjust,
+ 			framesize_cache[i].flags & FRAMESIZE_VALIDATE ?
+ 			"V" : "-");	
+-        	if ((sp = value_search(framesize_cache[i].pc, &offset))) {
+-			fprintf(ofp, "(%s+", sp->name);
++        	if ((sp = value_search(framesize_cache[i].pc, &offset)) ||
++		    (spm = kl_lkup_symaddr(framesize_cache[i].pc))) {
++			if (sp) 
++				fprintf(ofp, "(%s+", sp->name);
++			else {
++				fprintf(ofp, "(%s+", spm->name);
++		    		offset = framesize_cache[i].pc - spm->value;
++			}
+ 			switch (pc->output_radix)
+ 			{
+ 			case 10:
+@@ -776,7 +804,7 @@ get_framesize(kaddr_t pc)
+ #endif
+ 
+ 	if (!(sp = kl_lkup_symaddr(pc))) {
+-		return(-1);
++		return(0);
+ 	}
+ #ifdef REDHAT
+ 	if (STREQ(sp->name, "do_IRQ") && (tt->flags & IRQSTACKS)) 
+@@ -5664,6 +5692,8 @@ get_instr_stream(kaddr_t pc, int bcount,
+ 	} 
+ #ifdef REDHAT
+ 	sp_next = next_symbol(NULL, sp1);
++	if (!sp_next)
++		return((instr_rec_t *)NULL);
+ 	sp_next_next = next_symbol(NULL, sp_next);
+ 
+         if (pc > (sp_next->s_addr - (acount * 15))) {

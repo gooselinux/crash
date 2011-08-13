@@ -1,0 +1,88 @@
+--- crash-5.0.0/s390x.c.orig
++++ crash-5.0.0/s390x.c
+@@ -1,8 +1,8 @@
+ /* s390.c - core analysis suite
+  *
+  * Copyright (C) 2001, 2002 Mission Critical Linux, Inc.
+- * Copyright (C) 2002, 2003, 2004, 2005, 2006 David Anderson
+- * Copyright (C) 2002, 2003, 2004, 2005, 2006 Red Hat, Inc. All rights reserved.
++ * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2009, 2010 David Anderson
++ * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2009, 2010 Red Hat, Inc. All rights reserved.
+  * Copyright (C) 2005, 2006 Michael Holzheu, IBM Corporation
+  *
+  * This program is free software; you can redistribute it and/or modify
+@@ -1033,7 +1033,7 @@ s390x_dis_filter(ulong vaddr, char *inbu
+ int
+ s390x_get_smp_cpus(void)
+ {
+-	return get_cpus_online();
++	return MAX(get_cpus_online(), get_highest_cpu_online()+1);
+ }
+ 
+ /*
+--- crash-5.0.0/x86.c.orig
++++ crash-5.0.0/x86.c
+@@ -1,8 +1,8 @@
+ /* x86.c - core analysis suite
+  *
+  * Portions Copyright (C) 1999, 2000, 2001, 2002 Mission Critical Linux, Inc.
+- * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008 David Anderson
+- * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008 Red Hat, Inc. All rights reserved.
++ * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010 David Anderson
++ * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010 Red Hat, Inc. All rights reserved.
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -3901,7 +3901,7 @@ x86_get_smp_cpus(void)
+ 		count = MAX(cpucount, kt->cpus);
+ 	}
+ 
+-	return count;
++	return MAX(count, get_highest_cpu_online()+1);
+ }
+ 
+ 
+--- crash-5.0.0/s390.c.orig
++++ crash-5.0.0/s390.c
+@@ -1,8 +1,8 @@
+ /* s390.c - core analysis suite
+  *
+  * Copyright (C) 2001, 2002 Mission Critical Linux, Inc.
+- * Copyright (C) 2002, 2003, 2004, 2005, 2006 David Anderson
+- * Copyright (C) 2002, 2003, 2004, 2005, 2006 Red Hat, Inc. All rights reserved.
++ * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2009, 2010 David Anderson
++ * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2009, 2010 Red Hat, Inc. All rights reserved.
+  * Copyright (C) 2005, 2006 Michael Holzheu, IBM Corporation
+  *
+  * This program is free software; you can redistribute it and/or modify
+@@ -1004,7 +1004,7 @@ s390_dis_filter(ulong vaddr, char *inbuf
+ int
+ s390_get_smp_cpus(void)
+ {
+-	return get_cpus_online();
++	return MAX(get_cpus_online(), get_highest_cpu_online()+1);
+ }
+ 
+ /*
+--- crash-5.0.0/ia64.c.orig
++++ crash-5.0.0/ia64.c
+@@ -1,8 +1,8 @@
+ /* ia64.c - core analysis suite
+  *
+  * Copyright (C) 1999, 2000, 2001, 2002 Mission Critical Linux, Inc.
+- * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007 David Anderson
+- * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007 Red Hat, Inc. All rights reserved.
++ * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2009, 2010 David Anderson
++ * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2009, 2010 Red Hat, Inc. All rights reserved.
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -2277,7 +2277,7 @@ ia64_get_smp_cpus(void)
+ 	int cpus;
+ 
+ 	if ((cpus = get_cpus_online()))
+-		return cpus;
++		return MAX(cpus, get_highest_cpu_online()+1);
+ 	else
+ 		return kt->cpus;
+ }

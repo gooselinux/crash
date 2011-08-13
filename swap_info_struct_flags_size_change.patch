@@ -1,0 +1,28 @@
+--- crash-5.0.0/memory.c.orig
++++ crash-5.0.0/memory.c
+@@ -11539,8 +11539,8 @@ static int
+ dump_swap_info(ulong swapflags, ulong *totalswap_pages, ulong *totalused_pages)
+ {
+ 	int i, j;
+-	int flags, swap_device, pages, prio, usedswap;
+-	ulong swap_file, max, swap_map, pct;
++	int swap_device, pages, prio, usedswap;
++	ulong flags, swap_file, max, swap_map, pct;
+ 	ulong vfsmnt;
+ 	ulong swap_info, swap_info_ptr;
+ 	ushort *smap;
+@@ -11576,8 +11576,12 @@ dump_swap_info(ulong swapflags, ulong *t
+ 		} else
+ 			fill_swap_info(swap_info);
+ 
+-		flags = INT(vt->swap_info_struct + 
+-			OFFSET(swap_info_struct_flags));
++		if (MEMBER_SIZE("swap_info_struct", "flags") == sizeof(uint))
++			flags = UINT(vt->swap_info_struct +
++				OFFSET(swap_info_struct_flags));
++		else
++			flags = ULONG(vt->swap_info_struct +
++				OFFSET(swap_info_struct_flags));
+ 
+ 		if (!(flags & SWP_USED))
+ 			continue;

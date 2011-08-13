@@ -1,0 +1,105 @@
+--- crash-5.0.0/lkcd_x86_trace.c.orig
++++ crash-5.0.0/lkcd_x86_trace.c
+@@ -1533,8 +1533,24 @@ find_trace(
+                 				pc = sp1->value + offset;
+ 					flag = EX_FRAME;
+ 				} else {
+-					curframe->error = KLE_BAD_RA;
+-					flag = 0;
++					if (!XEN_HYPER_MODE() &&
++					    !is_kernel_thread(bt->task) &&
++					    (bt->stacktop == machdep->get_stacktop(bt->task))) {
++					    	if (((ulong)(bp+4) + SIZE(pt_regs)) > bt->stacktop)
++							flag = INCOMPLETE_EX_FRAME;
++						else if ((sp1 = eframe_label(NULL, pc)) &&
++					    	    	STREQ(sp1->name, "system_call"))
++							flag = EX_FRAME|SET_EX_FRAME_ADDR;
++						else if (STREQ(closest_symbol(pc), "ret_from_fork"))
++							flag = EX_FRAME|SET_EX_FRAME_ADDR;
++						else {
++							curframe->error = KLE_BAD_RA;
++							flag = 0;
++						}
++					} else {
++						curframe->error = KLE_BAD_RA;
++						flag = 0;
++					}
+ 				}
+ #else
+ 				curframe->error = KLE_BAD_RA;
+@@ -1821,6 +1837,32 @@ dump_stack_frame(trace_t *trace, sframe_
+ }
+ 
+ /*
++ *  eframe_address()
++ */
++static uaddr_t *
++eframe_address(sframe_t *frmp, struct bt_info *bt)
++{
++	ulong esp0, pt;
++
++	if (!(frmp->flag & SET_EX_FRAME_ADDR) ||
++	    INVALID_MEMBER(task_struct_thread) || 
++	    (((esp0 = MEMBER_OFFSET("thread_struct", "esp0")) < 0) &&
++	     ((esp0 = MEMBER_OFFSET("thread_struct", "sp0")) < 0)))
++		return frmp->asp;
++	/*  
++	 * Work required in rarely-seen SET_EX_FRAME_ADDR circumstances.
++	 */
++	pt = ULONG(tt->task_struct + OFFSET(task_struct_thread) + esp0) 
++	    	- SIZE(pt_regs);
++
++	if (!INSTACK(pt, bt))
++		return frmp->asp;
++
++	return ((uint32_t *)(bt->stackbuf + (pt - bt->stackbase)));
++}
++
++
++/*
+  * print_trace()
+  */
+ void
+@@ -1830,7 +1872,6 @@ print_trace(trace_t *trace, int flags, F
+ #ifdef REDHAT
+ 	kaddr_t fp = 0;
+ 	kaddr_t last_fp, last_pc, next_fp, next_pc;
+-	uaddr_t *pt;
+ 	struct bt_info *bt;
+ 
+ 	bt = trace->bt;
+@@ -1891,14 +1932,21 @@ print_trace(trace_t *trace, int flags, F
+ 			fprintf(ofp, " [0x%x]\n", frmp->pc);
+ #endif
+ 			if (frmp->flag & EX_FRAME) {
+-				pt = frmp->asp;
+ 				if (CRASHDEBUG(1))
+ 					fprintf(ofp, 
+ 					    " EXCEPTION FRAME: %lx\n", 
+ 						(unsigned long)frmp->sp);
+-				print_eframe(ofp, pt);
++				print_eframe(ofp, eframe_address(frmp, bt));
+ 			}
+ #ifdef REDHAT
++			if (CRASHDEBUG(1) && (frmp->flag & INCOMPLETE_EX_FRAME)) {
++				fprintf(ofp, " INCOMPLETE EXCEPTION FRAME:\n");
++				fprintf(ofp,
++				    "    user stacktop: %lx  frame #%d: %lx  (+pt_regs: %lx)\n",
++					bt->stacktop, frmp->level, (ulong)frmp->fp,
++					(ulong)frmp->fp + SIZE(pt_regs));
++			}
++
+ 			if (trace->bt->flags & BT_FULL) {
+                                 fprintf(ofp, "    [RA: %x  SP: %x  FP: %x  "
+                                         "SIZE: %d]\n", frmp->ra, frmp->sp,
+--- crash-5.0.0/lkcd_x86_trace.h.orig
++++ crash-5.0.0/lkcd_x86_trace.h
+@@ -467,6 +467,8 @@ typedef struct sframe_rec {
+ #define EX_FRAME	0x1	/* this frame is an interrupt or exception 
+ 				   frame, pt_regs field of sframe_t is valid 
+ 				   in this case */
++#define INCOMPLETE_EX_FRAME  0x2
++#define SET_EX_FRAME_ADDR    0x4
+ 
+ /* Stack segment structure
+  */

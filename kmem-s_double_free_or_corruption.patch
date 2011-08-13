@@ -1,0 +1,12 @@
+--- crash-5.0.0/memory.c.orig
++++ crash-5.0.0/memory.c
+@@ -9196,9 +9196,6 @@ do_slab_chain_percpu_v2_nodes(long cmd, 
+ 					tmp = INT(slab_buf + OFFSET(slab_inuse));
+ 					si->inuse += tmp;
+ 	
+-					if (ACTIVE())
+-						gather_cpudata_list_v2_nodes(si, index); 
+-
+ 					si->s_mem = ULONG(slab_buf + 
+ 						OFFSET(slab_s_mem));
+ 					gather_slab_cached_count(si);

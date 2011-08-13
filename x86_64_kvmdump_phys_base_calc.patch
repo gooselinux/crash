@@ -1,0 +1,1187 @@
+--- crash-5.0.0/help.c.orig
++++ crash-5.0.0/help.c
+@@ -1729,6 +1729,40 @@ char *help_mach[] = {
+ NULL               
+ };
+ 
++char *help_map[] = {
++"map",
++"store KVM dumpfile memory map data",    
++"[-a][-f [filename]]",
++"  The layout of KVM guest dumpfiles created with \"virsh dump\" does not allow",
++"  the crash utility to access the system's memory in a random access manner.",
++"  Therefore, during crash session initialization, a potentially time-consuming",
++"  dumpfile scan procedure is required to create a physical-memory-to-file-offset",
++"  map for use during the session.",
++" ",  
++"  This command may be used to append the memory map data to the dumpfile or",
++"  to store it in a permanent file.  After this has been done, subsequent crash",
++"  sessions using the dumpfile will no longer require the scan procedure:",
++" ", 
++"    -a  Append the memory map to the end of the KVM dumpfile.",
++"    -f  Create a memory map file.  If no filename argument is entered, the",
++"        filename will consist of the dumpfile name with \".map\" appended,",
++"        and will be located in the same directory as the dumpfile; it will",
++"        be recognized and used automatically during subsequent %s sessions.",
++"        However, if a \"filename\" argument is entered, and the default location",
++"        and naming convention are not used, then the new memory map file will",
++"        have to be added to the %s command line during invocation.",
++"\nEXAMPLES", 
++"    %s> map",
++"    MAP FILE IN USE: vmcore.map",
++"    %s> map -a",
++"    MAP FILE APPENDED TO: vmcore",
++"    %s> map -f",
++"    MAP FILE CREATED: vmcore.map",
++"    %s> map -f /tmp/vmcore.map",
++"    MAP FILE CREATED: /tmp/vmcore.map",
++NULL
++};
++
+ char *help_timer[] = {
+ "timer",
+ "timer queue data",
+--- crash-5.0.0/kvmdump.h.orig
++++ crash-5.0.0/kvmdump.h
+@@ -1,8 +1,8 @@
+ /* 
+  * kvmdump.h
+  *
+- * Copyright (C) 2009 David Anderson
+- * Copyright (C) 2009 Red Hat, Inc. All rights reserved.
++ * Copyright (C) 2009, 2010 David Anderson
++ * Copyright (C) 2009, 2010 Red Hat, Inc. All rights reserved.
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -15,16 +15,27 @@
+  * GNU General Public License for more details.
+  */
+ 
++struct mapinfo_trailer {
++	uint64_t map_start_offset;
++	uint64_t phys_base;
++	uint32_t cpu_version_id;
++	uint32_t ram_version_id;
++	uint64_t checksum;
++	uint64_t magic;
++};
++
++#define MAPFILE_MAGIC (0xfeedbabedeadbeefULL)
++#define CHKSUM_SIZE   (4096)
++
+ #define KVMDUMP_CACHED_PAGES 32
+ 
+ struct kvmdump_data {
+ 	ulong flags;
+ 	FILE *ofp;
+-	FILE *mem;
+ 	FILE *vmp;
+-	ulong *debug;
+-	ulong phys_base;
+-	uint64_t last_ram_offset;
++	int mapfd;
++	int vmfd;
++	struct mapinfo_trailer mapinfo;
+         /* page cache */
+         struct kvm_page_cache_hdr {
+                 uint64_t paddr;
+@@ -38,14 +49,19 @@ struct kvmdump_data {
+ 	ulong accesses;
+ 	ulong hit_count;
+ 	ulong compresses;
++	uint64_t kvbase;
++	ulong *debug;
+ };
+ 
++#define TMPFILE           (0x2)
++#define MAPFILE           (0x4)
++#define MAPFILE_FOUND     (0x8)
++#define MAPFILE_APPENDED (0x10)
++
+ extern struct kvmdump_data *kvm;
+ 
+ #undef dprintf
+ #define dprintf(x...)   do { if (*(kvm->debug)) fprintf(kvm->ofp, x); } while (0)
+ 
+-#define MEMFILE_OFFSET(addr) ((off_t)((((uint64_t)addr/(uint64_t)4096)) * sizeof(off_t))) 
+-
+-int store_memfile_offset(uint64_t, off_t *);
+-int load_memfile_offset(uint64_t, off_t *);
++int store_mapfile_offset(uint64_t, off_t *);
++int load_mapfile_offset(uint64_t, off_t *);
+--- crash-5.0.0/kvmdump.c.orig
++++ crash-5.0.0/kvmdump.c
+@@ -1,8 +1,8 @@
+ /*
+  * kvmdump.c
+  *
+- * Copyright (C) 2009 David Anderson
+- * Copyright (C) 2009 Red Hat, Inc. All rights reserved.
++ * Copyright (C) 2009, 2010 David Anderson
++ * Copyright (C) 2009, 2010 Red Hat, Inc. All rights reserved.
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -18,9 +18,16 @@
+ #include "defs.h"
+ #include "kvmdump.h"
+ 
+-static struct kvmdump_data kvmdump_data = { 0 };
++static struct kvmdump_data kvmdump_data = { 0 };  
+ struct kvmdump_data *kvm = &kvmdump_data;
+ static int cache_page(physaddr_t);
++static int kvmdump_mapfile_exists(void);
++static off_t mapfile_offset(uint64_t);
++static void kvmdump_mapfile_create(char *);
++static void kvmdump_mapfile_append(void);
++static char *mapfile_in_use(void);
++static void write_mapfile_trailer(void);
++static void read_mapfile_trailer(void);
+ 
+ #define RAM_OFFSET_COMPRESSED (~(off_t)255)
+ #define QEMU_COMPRESSED       ((WRITE_ERROR)-1)
+@@ -29,14 +36,55 @@ static int cache_page(physaddr_t);
+ int 
+ is_kvmdump(char *filename)
+ {
+-	return (is_qemu_vm_file(filename));
++	int i;
++	ulong *ptr;
++	off_t eof;
++	ulonglong csum;
++	struct mapinfo_trailer trailer;
++	char buf[CHKSUM_SIZE];
++
++	if (!is_qemu_vm_file(filename))
++		return FALSE;
++
++	if (lseek(kvm->vmfd, 0, SEEK_SET) < 0) {
++		error(INFO, "%s: read: %s\n", filename, strerror(errno));
++		return FALSE;
++	}
++	if (read(kvm->vmfd, buf, CHKSUM_SIZE) != CHKSUM_SIZE) {
++		error(INFO, "%s: read: %s\n", filename, strerror(errno));
++		return FALSE;
++        }
++
++	ptr = (ulong *)&buf[0];	
++	for (i = csum = 0; i < (CHKSUM_SIZE/sizeof(ulong)); i++, ptr++)
++		csum += *ptr;
++
++	eof = lseek(kvm->vmfd, 0, SEEK_END);
++	if (lseek(kvm->vmfd, eof - sizeof(trailer), SEEK_SET) < 0) {
++		error(INFO, "%s: lseek: %s\n", filename, strerror(errno));
++		return FALSE;
++	} 
++	if (read(kvm->vmfd, &trailer, sizeof(trailer)) != sizeof(trailer)) {
++		error(INFO, "%s: read: %s\n", filename, strerror(errno));
++		return FALSE;
++	}
++	if (trailer.magic == MAPFILE_MAGIC) {
++		kvm->mapinfo.map_start_offset = trailer.map_start_offset;
++		kvm->flags |= MAPFILE_APPENDED;
++	}
++
++	kvm->mapinfo.checksum = csum;
++
++	return TRUE;
+ }
+ 
+ int 
+ kvmdump_init(char *filename, FILE *fptr)
+ {
+ 	int i, page_size;
+-	char *buf;
++        struct command_table_entry *cp;
++	char *cachebuf;
++	FILE *tmpfp;
+ 
+ 	if (!machine_type("X86") && !machine_type("X86_64")) {
+ 		error(FATAL, "invalid host architecture for KVM: %s\n",
+@@ -48,20 +96,63 @@ kvmdump_init(char *filename, FILE *fptr)
+ 	kvm->debug = &pc->debug;
+ 	page_size = memory_page_size();
+ 
+-	if ((kvm->mem = tmpfile()) == NULL)
+-		 error(FATAL, 
+-		    "cannot create tmpfile for KVM file offsets: %s\n", 
+-			strerror(errno));
++#ifdef X86_64
++	kvm->kvbase = __START_KERNEL_map;
++#endif
++
++	switch (kvm->flags & (TMPFILE|MAPFILE|MAPFILE_APPENDED))
++	{
++	case MAPFILE_APPENDED:
++		kvm->mapfd = kvm->vmfd;
++		break;
+ 
+-        if ((buf = calloc(1, KVMDUMP_CACHED_PAGES * page_size)) == NULL)
++	case MAPFILE|MAPFILE_APPENDED:
++	case MAPFILE:
++		break;
++
++	default:
++		if (kvmdump_mapfile_exists())
++			break;
++
++		if ((tmpfp = tmpfile()) == NULL) 
++			error(FATAL, 
++			    "cannot create tmpfile for KVM file offsets: %s\n", 
++				strerror(errno));
++
++		kvm->mapfd = fileno(tmpfp);
++		kvm->flags |= TMPFILE;
++		break;
++	}
++
++        if ((cachebuf = calloc(1, KVMDUMP_CACHED_PAGES * page_size)) == NULL)
+                 error(FATAL, "%s: cannot malloc KVM page_cache_buf\n");
+ 
+ 	for (i = 0; i < KVMDUMP_CACHED_PAGES; i++) {
+ 		kvm->page_cache[i].paddr = CACHE_UNUSED;
+-		kvm->page_cache[i].bufptr = buf + (i * page_size);
++		kvm->page_cache[i].bufptr = cachebuf + (i * page_size);
+ 	}
+ 
+ 	if (qemu_init(filename)) {
++		switch (kvm->flags & (TMPFILE|MAPFILE|MAPFILE_APPENDED))
++		{
++		case TMPFILE:
++			write_mapfile_trailer();
++			break;
++
++		case MAPFILE:
++		case MAPFILE_APPENDED:
++		case MAPFILE|MAPFILE_APPENDED:
++			read_mapfile_trailer();
++			break;
++		}
++
++		for (cp = pc->cmd_table; cp->name; cp++) {
++			if (STREQ(cp->name, "map")) {
++				cp->flags &= ~HIDDEN_COMMAND;
++				break;
++			}
++		}
++
+ 		kvm->flags |= KVMDUMP_LOCAL; 
+ 		return TRUE;
+ 	} else
+@@ -122,29 +213,53 @@ int 
+ kvmdump_memory_dump(FILE *ofp)
+ {
+ 	int i, others;
++	struct mapinfo_trailer trailer;
++	off_t eof;
+ 
+-	fprintf(ofp, "          flags: %lx (", kvm->flags);
++	fprintf(ofp, "            flags: %lx (", kvm->flags);
+ 	others = 0;
+ 	if (kvm->flags & KVMDUMP_LOCAL)
+ 		fprintf(ofp, "%sKVMDUMP_LOCAL", others++ ? "|" : "");
++	if (kvm->flags & TMPFILE)
++		fprintf(ofp, "%sTMPFILE", others++ ? "|" : "");
++	if (kvm->flags & MAPFILE)
++		fprintf(ofp, "%sMAPFILE", others++ ? "|" : "");
++	if (kvm->flags & MAPFILE_FOUND)
++		fprintf(ofp, "%sMAPFILE_FOUND", others++ ? "|" : "");
++	if (kvm->flags & MAPFILE_APPENDED)
++		fprintf(ofp, "%sMAPFILE_APPENDED", others++ ? "|" : "");
+ 	fprintf(ofp, ")\n");
+-	fprintf(ofp, "            ofp: %lx\n", (ulong)kvm->ofp);
+-	fprintf(ofp, "            mem: %lx\n", (ulong)kvm->mem);
+-	fprintf(ofp, "            vmp: %lx\n", (ulong)kvm->vmp);
+-	fprintf(ofp, "          debug: %lx\n", (ulong)kvm->debug);
+-	fprintf(ofp, "      phys_base: %lx\n", kvm->phys_base);
+-	fprintf(ofp, "last_ram_offset: %llx\n", (ulonglong)kvm->last_ram_offset);
+-
+-	fprintf(ofp, "      curbufptr: %lx\n", (ulong)kvm->un.curbufptr);
+-	fprintf(ofp, "    evict_index: %d\n", kvm->evict_index);
+-	fprintf(ofp, "       accesses: %ld\n", kvm->accesses);
+-	fprintf(ofp, "      hit_count: %ld ", kvm->hit_count);
++
++	fprintf(ofp, "            mapfd: %d\n", kvm->mapfd);
++	fprintf(ofp, "             vmfd: %d\n", kvm->vmfd);
++	fprintf(ofp, "              vmp: %lx (fd: %d)\n", (ulong)kvm->vmp, 
++		fileno(kvm->vmp));
++	fprintf(ofp, "              ofp: %lx\n", (ulong)kvm->ofp);
++	fprintf(ofp, "            debug: %lx\n", (ulong)kvm->debug);
++	if (machine_type("X86_64"))
++        	fprintf(ofp, "           kvbase: %llx\n", (ulonglong)kvm->kvbase);
++	else
++        	fprintf(ofp, "           kvbase: (unused)\n");
++	fprintf(ofp, "          mapinfo:\n");
++        fprintf(ofp, "              magic: %llx %s\n", (ulonglong)kvm->mapinfo.magic,
++		kvm->mapinfo.magic == MAPFILE_MAGIC ?  "(MAPFILE_MAGIC)" : "");
++        fprintf(ofp, "          phys_base: %llx %s\n", (ulonglong)kvm->mapinfo.phys_base,
++		machine_type("X86") ? "(unused)" : "");
++        fprintf(ofp, "     cpu_version_id: %ld\n", (ulong)kvm->mapinfo.cpu_version_id);
++        fprintf(ofp, "     ram_version_id: %ld\n", (ulong)kvm->mapinfo.ram_version_id);
++        fprintf(ofp, "   map_start_offset: %llx\n", (ulonglong)kvm->mapinfo.map_start_offset);
++        fprintf(ofp, "           checksum: %llx\n", (ulonglong)kvm->mapinfo.checksum);
++
++	fprintf(ofp, "        curbufptr: %lx\n", (ulong)kvm->un.curbufptr);
++	fprintf(ofp, "      evict_index: %d\n", kvm->evict_index);
++	fprintf(ofp, "         accesses: %ld\n", kvm->accesses);
++	fprintf(ofp, "        hit_count: %ld ", kvm->hit_count);
+ 	if (kvm->accesses)
+ 		fprintf(ofp, "(%ld%%)\n",
+ 			kvm->hit_count * 100 / kvm->accesses);
+ 	else
+ 		fprintf(ofp, "\n");
+-	fprintf(ofp, "     compresses: %ld ", kvm->compresses);
++	fprintf(ofp, "       compresses: %ld ", kvm->compresses);
+ 	if (kvm->accesses)
+ 		fprintf(ofp, "(%ld%%)\n",
+ 			kvm->compresses * 100 / kvm->accesses);
+@@ -153,11 +268,11 @@ kvmdump_memory_dump(FILE *ofp)
+ 
+ 	for (i = 0; i < KVMDUMP_CACHED_PAGES; i++) {
+ 		if (kvm->page_cache[i].paddr == CACHE_UNUSED)
+-			fprintf(ofp, " %spage_cache[%d]: CACHE_UNUSED\n", 
++			fprintf(ofp, "   %spage_cache[%d]: CACHE_UNUSED\n", 
+ 				i < 10 ? " " : "", i);
+ 		else
+ 			fprintf(ofp, 
+-			    " %spage_cache[%d]: bufptr: %lx  addr: %llx\n",
++			    "   %spage_cache[%d]: bufptr: %lx  addr: %llx\n",
+ 				i < 10 ? " " : "", i,
+ 				(ulong)kvm->page_cache[i].bufptr,
+ 				(ulonglong)kvm->page_cache[i].paddr);
+@@ -168,6 +283,25 @@ kvmdump_memory_dump(FILE *ofp)
+ 
+ 	dump_qemu_header(ofp);
+ 
++	fprintf(ofp, "\n%s: mapinfo trailer:\n\n", mapfile_in_use());
++
++	eof = lseek(kvm->mapfd, 0, SEEK_END);
++	if (lseek(kvm->mapfd, eof - sizeof(trailer), SEEK_SET) < 0)
++		error(FATAL, "%s: lseek: %s\n", mapfile_in_use(), 
++			strerror(errno));
++	if (read(kvm->mapfd, &trailer, sizeof(trailer)) != sizeof(trailer))
++		error(FATAL, "%s: read: %s\n", mapfile_in_use(), 
++			strerror(errno));
++
++	fprintf(ofp, "             magic: %llx %s\n", (ulonglong)trailer.magic,
++		trailer.magic == MAPFILE_MAGIC ? "(MAPFILE_MAGIC)" : "");
++	fprintf(ofp, "         phys_base: %llx %s\n", (ulonglong)trailer.phys_base,
++		machine_type("X86") ? "(unused)" : "");
++	fprintf(ofp, "    cpu_version_id: %ld\n", (ulong)trailer.cpu_version_id);
++	fprintf(ofp, "    ram_version_id: %ld\n", (ulong)trailer.ram_version_id);
++        fprintf(ofp, "  map_start_offset: %llx\n", (ulonglong)trailer.map_start_offset);
++	fprintf(ofp, "          checksum: %llx\n\n", (ulonglong)trailer.checksum);
++
+ 	return TRUE;
+ }
+ 
+@@ -187,7 +321,13 @@ int
+ kvmdump_phys_base(unsigned long *phys_base)
+ {
+         if (KVMDUMP_VALID()) {
+-                *phys_base = kvm->phys_base;
++		if (CRASHDEBUG(1) && (kvm->mapinfo.cpu_version_id > 9)) 
++			error(NOTE, 
++			    "KVM/QEMU CPU_SAVE_VERSION %d is greater than"
++			    " supported version 9\n\n",
++				kvm->mapinfo.cpu_version_id);
++
++                *phys_base = kvm->mapinfo.phys_base;
+                 return TRUE;
+         }
+ 
+@@ -217,7 +357,7 @@ cache_page(physaddr_t paddr)
+ 		}
+ 	}
+ 
+-	if ((err = load_memfile_offset(paddr, &offset)) < 0)
++	if ((err = load_mapfile_offset(paddr, &offset)) < 0)
+ 		return err;
+ 
+         if ((offset & RAM_OFFSET_COMPRESSED) == RAM_OFFSET_COMPRESSED) {
+@@ -230,11 +370,11 @@ cache_page(physaddr_t paddr)
+ 	pgc = &kvm->page_cache[idx];
+         page_size = memory_page_size();
+ 
+-	if (fseek(kvm->vmp, offset, SEEK_SET) < 0) {
++	if (lseek(kvm->vmfd, offset, SEEK_SET) < 0) {
+ 		pgc->paddr = CACHE_UNUSED;
+ 		return SEEK_ERROR;
+ 	}
+-	if (fread(pgc->bufptr, page_size, 1, kvm->vmp) != 1) {
++	if (read(kvm->vmfd, pgc->bufptr, page_size) != page_size) {
+ 		pgc->paddr = CACHE_UNUSED;
+ 		return READ_ERROR;
+ 	}
+@@ -247,16 +387,42 @@ cache_page(physaddr_t paddr)
+ 	return idx;
+ }
+ 
++static off_t 
++mapfile_offset(uint64_t physaddr)
++{
++	off_t offset = 0;
++
++	switch (kvm->flags & (TMPFILE|MAPFILE|MAPFILE_APPENDED))
++	{
++	case TMPFILE:
++	case TMPFILE|MAPFILE_APPENDED:
++	case MAPFILE:
++	case MAPFILE|MAPFILE_APPENDED:
++		offset = (off_t)(((((uint64_t)physaddr/(uint64_t)4096)) 
++			* sizeof(off_t))); 
++		break;
++	
++	case MAPFILE_APPENDED:
++		offset = (off_t)(((((uint64_t)physaddr/(uint64_t)4096)) 
++			* sizeof(off_t)) + kvm->mapinfo.map_start_offset); 
++                break;
++	}
++
++	return offset;
++}
++
+ int 
+-store_memfile_offset(uint64_t physaddr, off_t *entry_ptr)
++store_mapfile_offset(uint64_t physaddr, off_t *entry_ptr)
+ {
+-        if (fseek(kvm->mem, MEMFILE_OFFSET(physaddr), SEEK_SET) < 0) {
+-		error(INFO, "%s: fseek: %s\n", pc->dumpfile, strerror(errno));
++        if (lseek(kvm->mapfd, mapfile_offset(physaddr), SEEK_SET) < 0) {
++		error(INFO, "%s: lseek: %s\n", 
++			mapfile_in_use(), strerror(errno));
+ 		return SEEK_ERROR;
+ 	}
+ 
+-        if (fwrite((entry_ptr), sizeof(off_t), 1, kvm->mem) != 1) {
+-		error(INFO, "%s: fwrite: %s\n", pc->dumpfile, strerror(errno));
++        if (write(kvm->mapfd, entry_ptr, sizeof(off_t)) != sizeof(off_t)) {
++		error(INFO, "%s: write: %s\n", 
++			mapfile_in_use(), strerror(errno));
+ 		return WRITE_ERROR;
+ 	}
+ 	
+@@ -264,19 +430,335 @@ store_memfile_offset(uint64_t physaddr, 
+ }
+ 
+ int 
+-load_memfile_offset(uint64_t physaddr, off_t *entry_ptr)
++load_mapfile_offset(uint64_t physaddr, off_t *entry_ptr)
+ {
+-        if (fseek(kvm->mem, MEMFILE_OFFSET(physaddr), SEEK_SET) < 0) {
+-		error(INFO, "%s: fseek: %s\n", pc->dumpfile, strerror(errno));
++        if (lseek(kvm->mapfd, mapfile_offset(physaddr), SEEK_SET) < 0) {
++		error(INFO, "load_memfile_offset: lseek: %s\n", 
++			strerror(errno));
+ 		return SEEK_ERROR;
+ 	}
+ 
+-        if (fread((entry_ptr), sizeof(off_t), 1, kvm->mem) != 1) {
+-		error(INFO, "%s: fwrite: %s\n", pc->dumpfile, strerror(errno));
++        if (read(kvm->mapfd, entry_ptr, sizeof(off_t)) != sizeof(off_t)) {
++		error(INFO, "load_memfile_offset: read: %s\n", strerror(errno));
+ 		return READ_ERROR;
+ 	}
+ 
+ 	return 0;
+ }
+ 
++static void
++kvmdump_mapfile_create(char *filename)
++{
++	int fdmem, n;
++	off_t offset;
++	char buf[4096];
++
++	if (kvm->flags & MAPFILE) {
++		error(INFO, "%s: mapfile in use\n", pc->kvmdump_mapfile);
++		return;
++	}
++
++	if (file_exists(filename, NULL)) {
++		error(INFO, 
++		    "%s: file already exists!\n", filename);
++		return;
++	}
++
++	if ((fdmem = open(filename, O_CREAT|O_RDWR, 0644)) < 0) {
++		error(INFO, "%s: open: %s\n", filename, strerror(errno));
++		return;
++	}
++
++	offset = kvm->mapinfo.map_start_offset;
++
++	if (lseek(kvm->mapfd, offset, SEEK_SET) < 0) {
++		error(INFO, "%s: leek: %s\n", 
++			mapfile_in_use(), strerror(errno));
++		return;
++	}
++
++	while ((n = read(kvm->mapfd, buf, 4096)) > 0) {
++		if (write(fdmem, buf, n) != n) {
++			error(INFO, "%s: write: %s\n", filename, 
++				strerror(errno));
++			break;
++		}
++	}
++
++	close(fdmem);
++
++	fprintf(fp, "MAP FILE CREATED: %s\n", filename);
++}
++
++static void
++kvmdump_mapfile_append(void)
++{
++	int n, fdcore; 
++	ulong round_bytes;
++	struct stat statbuf;
++	uint64_t map_start_offset;
++	off_t eof, orig_dumpfile_size;
++	char buf[4096];
++
++	if (kvm->flags & MAPFILE_APPENDED)
++		error(FATAL, "mapfile already appended to %s\n",
++			pc->dumpfile);
++
++	if (access(pc->dumpfile, W_OK) != 0)
++		error(FATAL, 
++		    "%s: cannot append map information to this file\n",
++			pc->dumpfile);
++
++	if (stat(pc->dumpfile, &statbuf) < 0)
++		error(FATAL, "%s: stat: %s\n",
++			pc->dumpfile, strerror(errno));
++
++	round_bytes = (sizeof(uint64_t) - (statbuf.st_size % sizeof(uint64_t)))
++		% sizeof(uint64_t);
++
++	if ((fdcore = open(pc->dumpfile, O_WRONLY)) < 0)
++		error(FATAL, "%s: open: %s\n", 
++			pc->dumpfile, strerror(errno));
++
++	if ((orig_dumpfile_size = lseek(fdcore, 0, SEEK_END)) < 0) {
++		error(INFO, "%s: lseek: %s\n", pc->dumpfile, strerror(errno));
++		goto bailout1;
++	}
++
++	if (round_bytes) {
++		BZERO(buf, round_bytes);
+ 
++		if (write(fdcore, buf, round_bytes) != round_bytes) {
++			error(INFO, "%s: write: %s\n", 
++				pc->dumpfile, strerror(errno));
++			goto bailout2;
++		}
++
++	}
++
++	map_start_offset = orig_dumpfile_size + round_bytes;
++
++	if (lseek(kvm->mapfd, 0, SEEK_SET) != 0) {
++		error(INFO, "%s: lseek: %s\n", 
++			mapfile_in_use(), strerror(errno));
++		goto bailout2;
++	}
++
++	while ((n = read(kvm->mapfd, buf, 4096)) > 0) {
++		if (write(fdcore, buf, n) != n) {
++			error(INFO, "%s: write: %s\n", pc->dumpfile, 
++				strerror(errno));
++			goto bailout2;
++		}
++	}
++
++	/*
++	 *  Overwrite the map_start_offset value in the trailer to reflect
++	 *  its location in the appended-to dumpfile.
++	 */
++        eof = lseek(fdcore, 0, SEEK_END);
++        if (lseek(fdcore, eof - sizeof(struct mapinfo_trailer), SEEK_SET) < 0) {
++		error(INFO, "%s: write: %s\n", pc->dumpfile, strerror(errno));
++		goto bailout2;
++	}
++	if (write(fdcore, &map_start_offset, sizeof(uint64_t)) != sizeof(uint64_t)) { 
++		error(INFO, "%s: write: %s\n", pc->dumpfile, strerror(errno));
++		goto bailout2;
++	}
++
++	close(fdcore);
++
++	kvm->flags |= MAPFILE_APPENDED;
++	fprintf(fp, "MAP FILE APPENDED TO: %s\n", pc->dumpfile);
++
++	return;
++
++bailout2:
++	if (ftruncate(fdcore, (off_t)orig_dumpfile_size) < 0)
++		error(INFO, "%s: ftruncate: %s\n", 
++			pc->dumpfile, strerror(errno));
++bailout1:
++	close(fdcore);
++	error(INFO, "failed to append map to %s\n", pc->dumpfile);
++}
++
++int 
++is_kvmdump_mapfile(char *filename)
++{
++	int fd;
++	struct mapinfo_trailer trailer;
++	off_t eof;
++
++        if ((fd = open(filename, O_RDONLY)) < 0) {
++                error(INFO, "%s: open: %s\n", filename, strerror(errno));
++                return FALSE;
++        }
++
++	eof = lseek(fd, 0, SEEK_END);
++	if (lseek(fd, eof - sizeof(trailer), SEEK_SET) < 0) {
++                error(INFO, "%s: lseek: %s\n", filename, strerror(errno));
++		goto bailout;
++	}
++
++        if (read(fd, &trailer, sizeof(trailer)) != sizeof(trailer)) {
++                error(INFO, "%s: read: %s\n", filename, strerror(errno));
++		goto bailout;
++        }
++
++	if (trailer.magic == MAPFILE_MAGIC) {
++		if (pc->dumpfile && (trailer.checksum != kvm->mapinfo.checksum)) {
++			error(kvm->flags & MAPFILE_FOUND ? INFO : FATAL,
++			    "checksum mismatch between %s and %s\n\n",
++				pc->dumpfile, filename);
++			goto bailout;
++		}
++		kvm->mapfd = fd;
++		kvm->flags |= MAPFILE;
++		return TRUE;
++	} 
++
++bailout:
++	close(fd);
++	return FALSE;
++}
++
++static int
++kvmdump_mapfile_exists(void)
++{
++	char *filename;
++	struct stat stat;
++
++	if (!(filename = malloc(strlen(pc->dumpfile) + strlen(".map") + 10))) 
++		return FALSE;
++
++	sprintf(filename, "%s.map", pc->dumpfile);
++
++	if (!file_exists(filename, &stat) || !S_ISREG(stat.st_mode))
++		return FALSE;
++
++	if (is_kvmdump_mapfile(filename)) {
++		pc->kvmdump_mapfile = filename;
++		kvm->flags |= MAPFILE_FOUND;
++		return TRUE;
++	}
++
++	free(filename);
++	return FALSE;
++}
++
++void
++cmd_map(void)
++{
++	int c;
++	int append, file, specified;
++	char *mapfile;
++
++	append = file = specified = 0;
++	mapfile = NULL;
++
++        while ((c = getopt(argcnt, args, "af")) != EOF) {
++                switch(c)
++		{
++		case 'a':
++			append++;
++			break;
++		case 'f':
++			file++;
++			break;
++		default:
++			argerrs++;
++			break;
++		}
++	}
++
++	if (argerrs)
++		cmd_usage(pc->curcmd, SYNOPSIS);
++
++        while (args[optind]) {
++		if (!mapfile) {
++			mapfile = args[optind];	
++			specified++;
++		} else
++			cmd_usage(pc->curcmd, SYNOPSIS);
++		optind++;
++	}
++
++	if (file && !specified) {
++		mapfile = GETBUF(strlen(pc->dumpfile)+10);
++		sprintf(mapfile, "%s.map", pc->dumpfile);
++	}
++
++	if (append)
++		kvmdump_mapfile_append();
++
++	if (file) {
++		kvmdump_mapfile_create(mapfile);
++		if (!specified)
++			FREEBUF(mapfile);
++	}
++
++	if (!file && !append)
++		fprintf(fp, "MAP FILE IN USE: %s\n", mapfile_in_use());
++}
++
++static char *
++mapfile_in_use(void)
++{
++	char *name;
++
++	switch (kvm->flags & (TMPFILE|MAPFILE|MAPFILE_APPENDED))
++	{
++	default:
++	case TMPFILE:
++	case TMPFILE|MAPFILE_APPENDED:
++		name = "(tmpfile)";
++		break;
++	case MAPFILE:
++	case MAPFILE|MAPFILE_APPENDED:
++		name = pc->kvmdump_mapfile;
++		break;
++	case MAPFILE_APPENDED:
++		name = pc->dumpfile;
++		break;
++	}
++
++	return name;
++}
++
++static void
++write_mapfile_trailer(void)
++{
++        kvm->mapinfo.magic = MAPFILE_MAGIC;
++
++        if (lseek(kvm->mapfd, 0, SEEK_END) < 0)
++		error(FATAL, "%s: lseek: %s\n", mapfile_in_use(), strerror(errno));
++
++	if (write(kvm->mapfd, &kvm->mapinfo, sizeof(struct mapinfo_trailer)) 
++	    != sizeof(struct mapinfo_trailer))
++		error(FATAL, "%s: write: %s\n", mapfile_in_use(), strerror(errno));
++}
++
++static void
++read_mapfile_trailer(void)
++{
++	off_t eof;
++	struct mapinfo_trailer trailer;
++
++	if ((eof = lseek(kvm->mapfd, 0, SEEK_END)) < 0)
++		error(FATAL, "%s: lseek: %s\n", 
++			mapfile_in_use(), strerror(errno));
++
++	if (lseek(kvm->mapfd, eof - sizeof(trailer), SEEK_SET) < 0)
++		error(FATAL, "%s: lseek: %s\n", 
++			mapfile_in_use(), strerror(errno));
++
++	if (read(kvm->mapfd, &trailer, sizeof(trailer)) != sizeof(trailer))
++		error(FATAL, "%s: read: %s\n", 
++			mapfile_in_use(), strerror(errno));
++
++	if (kvm->mapinfo.checksum != trailer.checksum)
++		error(FATAL, "checksum mismatch between %s and %s\n",
++			pc->dumpfile, mapfile_in_use());
++
++	kvm->mapinfo = trailer;
++}
+--- crash-5.0.0/qemu-load.c.orig
++++ crash-5.0.0/qemu-load.c
+@@ -1,7 +1,7 @@
+ /*
+  * Qemu save VM loader
+  *
+- * Copyright (C) 2009 Red Hat, Inc.
++ * Copyright (C) 2009, 2010 Red Hat, Inc.
+  * Written by Paolo Bonzini.
+  *
+  * Portions Copyright (C) 2009 David Anderson
+@@ -209,12 +209,12 @@ ram_load (struct qemu_device *d, FILE *f
+ 		else if (header & RAM_SAVE_FLAG_COMPRESS) {
+ //			dram->offsets[addr / 4096] =
+ 			entry = RAM_OFFSET_COMPRESSED | getc(fp);
+-			store_memfile_offset(addr, &entry);
++			store_mapfile_offset(addr, &entry);
+ 		}
+ 		else if (header & RAM_SAVE_FLAG_PAGE) {
+ //			dram->offsets[addr / 4096] = ftell (fp);
+ 			entry = ftell(fp);
+-			store_memfile_offset(addr, &entry);
++			store_mapfile_offset(addr, &entry);
+ 			fseek (fp, 4096, SEEK_CUR);
+ 		}
+ 
+@@ -241,7 +241,7 @@ ram_read_phys_page (struct qemu_device_r
+                 return false;
+         assert ((addr & 0xfff) == 0);
+ //	ofs = dram->offsets[addr / 4096];
+-	if (load_memfile_offset(addr, &ofs) < 0)
++	if (load_mapfile_offset(addr, &ofs) < 0)
+ 		return 0;
+ 	if ((ofs & RAM_OFFSET_COMPRESSED) == RAM_OFFSET_COMPRESSED)
+ 		memset (buf, ofs & 255, 4096);
+@@ -262,6 +262,7 @@ ram_init_load (struct qemu_device_list *
+ 	};
+ 
+ 	assert (version_id == 3);
++	kvm->mapinfo.ram_version_id = version_id;
+ 	return device_alloc (dl, sizeof (struct qemu_device_ram),
+ 			     &ram, section_id, instance_id);
+ }
+@@ -481,7 +482,9 @@ cpu_init_load_32 (struct qemu_device_lis
+ 	};
+ 
+ 	assert (!live);
+-	assert (version_id >= 4 && version_id <= 9);
++//	assert (version_id >= 4 && version_id <= 9);
++	assert (version_id >= 4 && version_id <= 12);
++	kvm->mapinfo.cpu_version_id = version_id;
+ 	dx86 = (struct qemu_device_x86 *)
+ 		device_alloc (dl, sizeof (struct qemu_device_x86),
+ 			      &cpu, section_id, instance_id);
+@@ -508,7 +511,9 @@ cpu_init_load_64 (struct qemu_device_lis
+ 	};
+ 
+ 	assert (!live);
+-	assert (version_id >= 4 && version_id <= 9);
++//	assert (version_id >= 4 && version_id <= 9);
++	assert (version_id >= 4 && version_id <= 12);
++	kvm->mapinfo.cpu_version_id = version_id;
+ 	dx86 = (struct qemu_device_x86 *)
+ 		device_alloc (dl, sizeof (struct qemu_device_x86),
+ 			      &cpu, section_id, instance_id);
+@@ -638,6 +643,7 @@ qemu_load (const struct qemu_device_load
+ 	   FILE *fp)
+ {
+ 	struct qemu_device_list *result = NULL;
++	struct qemu_device *last = NULL;;
+ 	size_t items;
+ 
+ 	switch (get_be32 (fp)) {
+@@ -664,6 +670,8 @@ qemu_load (const struct qemu_device_load
+ 	if (get_be32 (fp) != 3)
+ 		return NULL;
+ 
++	dprintf("\n");
++
+ 	result = calloc (1, sizeof (struct qemu_device_list));
+ 	for (;;) {
+ 		struct qemu_device *d;
+@@ -679,7 +687,10 @@ qemu_load (const struct qemu_device_load
+ 		if (!d)
+ 			break;
+ 
+-		dprintf("qemu_load: \"%s\"\n", d->vtbl->name);
++		if (d != last) {
++			dprintf("qemu_load: \"%s\"\n", d->vtbl->name);
++			last = d;
++		}
+ 
+ 		features = d->vtbl->load (d, fp, sec);
+ 		if (feof (fp) || ferror (fp))
+@@ -711,11 +722,12 @@ int
+ is_qemu_vm_file(char *filename)
+ {
+ 	struct libvirt_header header;
++	FILE *vmp;
+ 	int retval;
+ 	size_t items;
+ 	char *xml;
+ 
+-	if ((kvm->vmp = fopen(filename, "r")) == NULL) {
++	if ((vmp = fopen(filename, "r")) == NULL) {
+ 		error(INFO, "%s: %s\n", filename, strerror(errno));
+ 		return FALSE;
+ 	}
+@@ -723,25 +735,25 @@ is_qemu_vm_file(char *filename)
+ 	retval = FALSE;
+ 	xml = NULL;
+ 
+-	switch (get_be32(kvm->vmp)) 
++	switch (get_be32(vmp)) 
+ 	{
+ 	case QEMU_VM_FILE_MAGIC:
+ 		retval = TRUE;
+ 		break;
+ 
+ 	case LIBVIRT_QEMU_VM_FILE_MAGIC: 
+-		rewind(kvm->vmp);
+-		items = fread(&header.magic[0], sizeof(header), 1, kvm->vmp); 
++		rewind(vmp);
++		items = fread(&header.magic[0], sizeof(header), 1, vmp); 
+ 		if (STRNEQ(header.magic, "LibvirtQemudSave")) {
+ 			if ((xml = (char *)malloc(header.xml_length))) {
+-				items = fread(xml, header.xml_length, 1, kvm->vmp);
++				items = fread(xml, header.xml_length, 1, vmp);
+ 				/*
+ 				 *  Parse here if necessary or desirable.
+ 				 */
+ 			} else
+-				fseek(kvm->vmp, header.xml_length, SEEK_CUR);
++				fseek(vmp, header.xml_length, SEEK_CUR);
+ 
+-			if (get_be32(kvm->vmp) == QEMU_VM_FILE_MAGIC)
++			if (get_be32(vmp) == QEMU_VM_FILE_MAGIC)
+ 				retval = TRUE;
+ 		}
+ 		break;
+@@ -752,8 +764,17 @@ is_qemu_vm_file(char *filename)
+ 
+ 	if (xml)
+ 		free(xml);
+-	if (retval == FALSE)
+-		fclose(kvm->vmp);
++
++	switch (retval) 
++	{
++	case TRUE:
++		kvm->vmp = vmp;
++		kvm->vmfd = fileno(vmp);
++		break;
++	case FALSE:
++		fclose(vmp);
++		break;
++	}
+ 
+ 	return retval;
+ }
+--- crash-5.0.0/main.c.orig
++++ crash-5.0.0/main.c
+@@ -1,8 +1,8 @@
+ /* main.c - core analysis suite
+  *
+  * Copyright (C) 1999, 2000, 2001, 2002 Mission Critical Linux, Inc.
+- * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009 David Anderson
+- * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009 Red Hat, Inc. All rights reserved.
++ * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010 David Anderson
++ * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010 Red Hat, Inc. All rights reserved.
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -420,6 +420,14 @@ main(int argc, char **argv)
+                                 pc->readmem = read_kvmdump;
+                                 pc->writemem = write_kvmdump;
+ 
++			} else if (is_kvmdump_mapfile(argv[optind])) {
++				if (pc->kvmdump_mapfile) {
++                                        error(INFO,
++                                            "too many KVM map file arguments\n");
++                                        program_usage(SHORT_FORM);
++				}
++				pc->kvmdump_mapfile = argv[optind];
++                                
+                         } else if (is_xendump(argv[optind])) {
+                                 if (pc->flags & MEMORY_SOURCES) {
+                                         error(INFO,
+@@ -1170,6 +1178,7 @@ dump_program_context(void)
+ 	fprintf(fp, "       system_map: %s\n", pc->system_map);
+ 	fprintf(fp, "   namelist_debug: %s\n", pc->namelist_debug);
+ 	fprintf(fp, "   debuginfo_file: %s\n", pc->debuginfo_file);
++	fprintf(fp, "  kvmdump_mapfile: %s\n", pc->kvmdump_mapfile);
+ 	fprintf(fp, "    memory_module: %s\n", pc->memory_module);
+ 	fprintf(fp, "    memory_device: %s\n", pc->memory_device);
+ 	fprintf(fp, "     machine_type: %s\n", pc->machine_type);
+--- crash-5.0.0/kernel.c.orig
++++ crash-5.0.0/kernel.c
+@@ -3872,6 +3872,10 @@ display_sys_stats(void)
+ 			fprintf(fp, "  [PARTIAL DUMP]");
+ 
+ 		fprintf(fp, "\n");
++
++		if (KVMDUMP_DUMPFILE() && pc->kvmdump_mapfile)
++			fprintf(fp, "     MAPFILE: %s\n",
++				pc->kvmdump_mapfile);
+ 	}
+ 	
+ 	fprintf(fp, "        CPUS: %d\n",
+--- crash-5.0.0/qemu.c.orig
++++ crash-5.0.0/qemu.c
+@@ -1,7 +1,7 @@
+ /*
+  * Derive kernel base from a QEMU saved VM file
+  *
+- * Copyright (C) 2009 Red Hat, Inc.
++ * Copyright (C) 2009, 2010 Red Hat, Inc.
+  * Written by Paolo Bonzini.
+  *
+  * Portions Copyright (C) 2009 David Anderson
+@@ -196,14 +196,50 @@ get_idt_base(struct qemu_device_list *dl
+ static uint64_t
+ get_kernel_base(struct qemu_device_list *dl)
+ {
++	int i;
++	uint64_t kernel_base = -1;
++	uint64_t base_vaddr, last, mask;
+ 	struct qemu_device_x86 *dx86 = (struct qemu_device_x86 *)
+ 		device_find_instance (dl, "cpu", 0);
+ 	struct qemu_device_ram *dram = (struct qemu_device_ram *)
+ 		device_find_instance (dl, "ram", 0);
+ 
+-	uint64_t base_vaddr = dx86->idt.base & ~((1LL << 30) - 1);
+-	dprintf ("Virtual base address guessed at %llx\n", (unsigned long long)base_vaddr);
+-	return get_phys_page(dx86, dram, base_vaddr);
++	for (i = 30, last = -1; (kernel_base == -1) && (i >= 20); i--)
++        {
++                mask = ~((1LL << i) - 1);
++                base_vaddr = dx86->idt.base & mask;
++		if (base_vaddr == last)
++			continue;
++		if (base_vaddr < kvm->kvbase) {
++			fprintf(stderr, 
++			    "WARNING: IDT base contains: %llx\n         "
++			    "cannot determine physical base address: defaulting to 0\n\n", 
++				(unsigned long long)base_vaddr);
++			return 0;
++		}
++		dprintf("get_kernel_base: %llx\n", (unsigned long long)base_vaddr);
++                kernel_base = get_phys_page(dx86, dram, base_vaddr);
++		last = base_vaddr;
++        }
++
++        if (kernel_base != -1) {
++		dprintf("kvbase: %llx vaddr used: %llx physical: %llx\n",
++			(unsigned long long)kvm->kvbase,
++			(unsigned long long)base_vaddr,
++			(unsigned long long)kernel_base);
++		/*
++		 *  Subtract the offset between the virtual address used
++		 *  and the kernel's base virtual address.
++		 */
++                kernel_base -= (base_vaddr - kvm->kvbase);
++        } else {
++		fprintf(stderr, 
++			"WARNING: cannot determine physical base address:"
++			" defaulting to 0\n\n");
++		kernel_base = 0;
++	}
++
++	return kernel_base;
+ }
+ 
+ 
+@@ -249,13 +285,16 @@ qemu_init(char *filename)
+ {
+ 	struct qemu_device_list *dl;
+ 	struct qemu_device_ram *dram;
+-	uint64_t idt;
++	uint64_t idt = 0;
+ 
+ 	if (CRASHDEBUG(1))
+ 		dump_qemu_header(kvm->ofp);
+ 
+ 	rewind(kvm->vmp);
+ 
++	if (kvm->flags & (MAPFILE|MAPFILE_APPENDED))
++		return TRUE;
++
+ 	please_wait("scanning KVM dumpfile");
+ 
+ 	if (machine_type("X86"))
+@@ -270,22 +309,23 @@ qemu_init(char *filename)
+ 	please_wait_done();
+ 
+ 	if (dl) {
+-		/*
+-		 *  TBD: the IDT base is a kernel virtual address -- verify here
+-		 *  that it makes sense for the host machine type.
+-		 */
+-		idt = get_idt_base(dl);
+-		kvm->phys_base = get_kernel_base(dl);
++		if (machine_type("X86_64")) {
++			idt = get_idt_base(dl);
++			kvm->mapinfo.phys_base = get_kernel_base(dl);
++		}
++
+ 		dram = (struct qemu_device_ram *) 
+ 			device_find_instance (dl, "ram", 0);
+-		kvm->last_ram_offset = dram->last_ram_offset;
+ 
+ 		if (CRASHDEBUG(1)) {
+-			fprintf(kvm->ofp, "IDT: %llx\n", (ulonglong)idt);
+-			fprintf(kvm->ofp, "physical kernel base: %lx\n", 
+-				kvm->phys_base); 
++			if (machine_type("X86_64")) {
++				fprintf(kvm->ofp, "IDT: %llx\n", 
++					(ulonglong)idt);
++				fprintf(kvm->ofp, "physical kernel base: %llx\n", 
++					(ulonglong)kvm->mapinfo.phys_base); 
++			}
+ 			fprintf(kvm->ofp, "last RAM offset: %llx\n", 
+-				(ulonglong)kvm->last_ram_offset); 
++				(ulonglong)dram->last_ram_offset); 
+ 		}
+ 
+ 		device_list_free (dl);
+--- crash-5.0.0/global_data.c.orig
++++ crash-5.0.0/global_data.c
+@@ -1,8 +1,8 @@
+ /* global_data.c - core analysis suite
+  *
+  * Copyright (C) 1999, 2000, 2001, 2002 Mission Critical Linux, Inc.
+- * Copyright (C) 2002, 2003, 2004, 2005 David Anderson
+- * Copyright (C) 2002, 2003, 2004, 2005 Red Hat, Inc. All rights reserved.
++ * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2010 David Anderson
++ * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2010 Red Hat, Inc. All rights reserved.
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -89,6 +89,7 @@ struct command_table_entry linux_command
+ 	{"list",    cmd_list,    help__list,   REFRESH_TASK_TABLE},
+ 	{"log",     cmd_log,     help_log,     0},
+ 	{"mach",    cmd_mach,    help_mach,    0},
++	{"map",     cmd_map,     help_map,     HIDDEN_COMMAND},
+ 	{"mod",     cmd_mod,     help_mod,     0},
+ 	{"mount",   cmd_mount,   help_mount,   0},
+ 	{"net",	    cmd_net,	help_net,      REFRESH_TASK_TABLE},
+--- crash-5.0.0/defs.h.orig
++++ crash-5.0.0/defs.h
+@@ -411,6 +411,7 @@ struct program_context {
+ 	ulong ifile_in_progress;        /* original xxx_IFILE flags */
+ 	off_t ifile_offset;             /* current offset into input file */
+ 	char *runtime_ifile_cmd;        /* runtime command using input file */
++	char *kvmdump_mapfile;          /* storage of physical to file offsets */
+ };
+ 
+ #define READMEM  pc->readmem
+@@ -3176,6 +3177,7 @@ void cmd_extend(void);       /* extensio
+ #if defined(S390) || defined(S390X)
+ void cmd_s390dbf(void);
+ #endif
++void cmd_map(void);          /* kvmdump.c */
+ 
+ /*
+  *  main.c
+@@ -3616,6 +3618,7 @@ extern char *help_wr[];
+ #if defined(S390) || defined(S390X)
+ extern char *help_s390dbf[];
+ #endif
++extern char *help_map[];
+ 
+ /*
+  *  task.c
+@@ -4278,6 +4281,7 @@ struct xendump_data *get_xendump_data(vo
+  * kvmdump.c
+  */
+ int is_kvmdump(char *);
++int is_kvmdump_mapfile(char *);
+ int kvmdump_init(char *, FILE *);
+ int read_kvmdump(int, void *, int, ulong, physaddr_t);
+ int write_kvmdump(int, void *, int, ulong, physaddr_t);

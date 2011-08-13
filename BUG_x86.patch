@@ -1,0 +1,18 @@
+Index: crash/kernel.c
+===================================================================
+RCS file: /nfs/projects/cvs/crash/kernel.c,v
+retrieving revision 1.221
+retrieving revision 1.222
+diff -u -r1.221 -r1.222
+--- crash/kernel.c	7 Dec 2009 21:39:57 -0000	1.221
++++ crash/kernel.c	11 Jan 2010 19:21:44 -0000	1.222
+@@ -1534,7 +1534,8 @@
+ 		if (parse_line(buf2, arglist) < 3)
+ 			continue;
+ 
+-		if ((vaddr = htol(arglist[0], RETURN_ON_ERROR, NULL)) >= spn->value)
++		if ((vaddr = htol(strip_ending_char(arglist[0], ':'), 
++		    RETURN_ON_ERROR, NULL)) >= spn->value)
+ 			continue; 
+ 
+ 		if (STREQ(arglist[2], "ud2a")) {

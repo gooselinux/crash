@@ -1,0 +1,53 @@
+--- crash-5.0.0/defs.h.orig
++++ crash-5.0.0/defs.h
+@@ -3717,6 +3717,7 @@ int get_cpus_present(void);
+ int get_cpus_possible(void);
+ int get_highest_cpu_online(void);
+ int in_cpu_map(int, int);
++int get_cpus_to_display(void);
+ void paravirt_init(void);
+ void print_stack_text_syms(struct bt_info *, ulong, ulong);
+ void back_trace(struct bt_info *);
+--- crash-5.0.0/ppc64.c.orig
++++ crash-5.0.0/ppc64.c
+@@ -2331,7 +2331,7 @@ ppc64_display_machine_stats(void)
+ 
+         fprintf(fp, "       MACHINE TYPE: %s\n", uts->machine);
+         fprintf(fp, "        MEMORY SIZE: %s\n", get_memory_size(buf));
+-        fprintf(fp, "               CPUS: %d\n", kt->cpus);
++	fprintf(fp, "               CPUS: %d\n", get_cpus_to_display());
+         fprintf(fp, "    PROCESSOR SPEED: ");
+         if ((mhz = machdep->processor_speed()))
+                 fprintf(fp, "%ld Mhz\n", mhz);
+--- crash-5.0.0/kernel.c.orig
++++ crash-5.0.0/kernel.c
+@@ -3874,8 +3874,8 @@ display_sys_stats(void)
+ 		fprintf(fp, "\n");
+ 	}
+ 	
+-
+-        fprintf(fp, "        CPUS: %d\n", kt->cpus);
++	fprintf(fp, "        CPUS: %d\n",
++		machine_type("PPC64") ? get_cpus_to_display() : kt->cpus);
+ 	if (ACTIVE())
+         	get_symbol_data("xtime", sizeof(struct timespec), &kt->date);
+         fprintf(fp, "        DATE: %s\n", 
+@@ -6261,6 +6261,18 @@ get_cpus_possible()
+ }
+ 
+ /*
++ *  When displaying cpus, return the number of cpus online if possible, 
++ *  otherwise kt->cpus.
++ */
++int
++get_cpus_to_display(void)
++{
++	int online = get_cpus_online();
++
++	return (online ? online : kt->cpus);
++}
++
++/*
+  *  Xen machine-address to pseudo-physical-page translator.
+  */ 
+ ulonglong

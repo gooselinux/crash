@@ -1,0 +1,12 @@
+--- crash-5.0.0/dev.c.orig
++++ crash-5.0.0/dev.c
+@@ -100,7 +100,8 @@ cmd_dev(void)
+ 			return;
+ 
+ 		case 'p':
+-			if (machine_type("S390X"))
++			if (machine_type("S390X") ||
++			    (THIS_KERNEL_VERSION >= LINUX(2,6,26)))
+ 				option_not_supported(c);
+ 			do_pci();
+ 			return;

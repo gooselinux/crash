@@ -1,0 +1,24 @@
+--- crash-5.0.0/x86.c.orig
++++ crash-5.0.0/x86.c
+@@ -3989,6 +3989,7 @@ static char *e820type[] = {
+ 	"E820_RESERVED",
+ 	"E820_ACPI",
+ 	"E820_NVS",
++	"E820_UNUSABLE",
+ };
+ 
+ static void
+@@ -4015,8 +4016,11 @@ x86_display_memmap(void)
+ 		addr = ULONGLONG(e820entry_ptr + OFFSET(e820entry_addr));
+ 		size = ULONGLONG(e820entry_ptr + OFFSET(e820entry_size));
+ 		type = ULONG(e820entry_ptr + OFFSET(e820entry_type));
+-		fprintf(fp, "%016llx - %016llx  %s\n", addr, addr+size, 
+-			e820type[type]);
++		fprintf(fp, "%016llx - %016llx  ", addr, addr+size);
++		if (type >= (sizeof(e820type)/sizeof(char *)))
++			fprintf(fp, "type %ld\n", type);
++		else
++			fprintf(fp, "%s\n", e820type[type]);
+ 	}
+ }
+ 

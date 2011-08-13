@@ -1,0 +1,97 @@
+--- crash-5.0.0/qemu-load.c.orig
++++ crash-5.0.0/qemu-load.c
+@@ -41,6 +41,7 @@ device_alloc (struct qemu_device_list *d
+ 	else {
+ 		dl->tail->next = d;
+ 		d->prev = dl->tail;
++		dl->tail = d;
+ 	}
+ 	return d;
+ }
+@@ -267,6 +268,34 @@ ram_init_load (struct qemu_device_list *
+ 			     &ram, section_id, instance_id);
+ }
+ 
++
++#define BLK_MIG_FLAG_EOS 2
++
++static uint32_t
++block_load (struct qemu_device *d, FILE *fp, enum qemu_save_section sec)
++{
++	uint64_t header;
++
++	header = get_be64 (fp);
++	assert (header == BLK_MIG_FLAG_EOS);
++	return 0;
++}
++
++static struct qemu_device *
++block_init_load (struct qemu_device_list *dl,
++		uint32_t section_id, uint32_t instance_id,
++		uint32_t version_id, bool live, FILE *fp)
++{
++	static struct qemu_device_vtbl block = {
++		"block",
++		block_load,
++		NULL
++	};
++
++	return device_alloc (dl, sizeof (struct qemu_device),
++			    &block, section_id, instance_id);
++}
++
+ /* cpu_common loader.  */
+ 
+ struct qemu_device_cpu_common {
+@@ -546,6 +575,31 @@ timer_init_load (struct qemu_device_list
+ 			     &timer, section_id, instance_id);
+ }
+ 
++/* kvmclock loader.  */
++
++static uint32_t
++kvmclock_load (struct qemu_device *d, FILE *fp, enum qemu_save_section sec)
++{
++	fseek (fp, 8, SEEK_CUR);
++	return QEMU_FEATURE_KVM;
++}
++
++static struct qemu_device *
++kvmclock_init_load (struct qemu_device_list *dl,
++		   uint32_t section_id, uint32_t instance_id,
++		   uint32_t version_id, bool live, FILE *fp)
++{
++	static struct qemu_device_vtbl kvmclock = {
++		"kvmclock",
++		kvmclock_load,
++		NULL
++	};
++
++	assert (!live);
++	return device_alloc (dl, sizeof (struct qemu_device),
++			    &kvmclock, section_id, instance_id);
++}
++
+ 
+ /* kvm-tpr-opt loader.  */
+ 
+@@ -578,7 +632,9 @@ kvm_tpr_opt_init_load (struct qemu_devic
+ const struct qemu_device_loader devices_x86_64[] = {
+ 	{ "cpu_common", cpu_common_init_load },
+ 	{ "kvm-tpr-opt", kvm_tpr_opt_init_load },
++	{ "kvmclock", kvmclock_init_load },
+ 	{ "cpu", cpu_init_load_64 },
++	{ "block", block_init_load },
+ 	{ "ram", ram_init_load },
+ 	{ "timer", timer_init_load },
+ 	{ NULL }
+@@ -587,7 +643,9 @@ const struct qemu_device_loader devices_
+ const struct qemu_device_loader devices_x86_32[] = {
+ 	{ "cpu_common", cpu_common_init_load },
+ 	{ "kvm-tpr-opt", kvm_tpr_opt_init_load },
++	{ "kvmclock", kvmclock_init_load },
+ 	{ "cpu", cpu_init_load_32 },
++	{ "block", block_init_load },
+ 	{ "ram", ram_init_load },
+ 	{ "timer", timer_init_load },
+ 	{ NULL }

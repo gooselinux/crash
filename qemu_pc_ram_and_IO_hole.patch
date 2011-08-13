@@ -1,0 +1,188 @@
+--- crash-5.0.0/x86_64.c.orig
++++ crash-5.0.0/x86_64.c
+@@ -81,7 +81,7 @@ static void parse_cmdline_args(void);
+ static void x86_64_clear_machdep_cache(void);
+ static void x86_64_irq_eframe_link_init(void);
+ static void x86_64_framepointer_init(void);
+-static void x86_64_xendump_phys_base(void);
++static int x86_64_virt_phys_base(void);
+ static int x86_64_xendump_p2m_create(struct xendump_data *);
+ static int x86_64_pvops_xendump_p2m_create(struct xendump_data *);
+ static char *x86_64_xendump_load_page(ulong, struct xendump_data *);
+@@ -5300,6 +5300,13 @@ x86_64_calc_phys_base(void)
+ 			if (CRASHDEBUG(1))
+ 				fprintf(fp, "kvmdump: phys_base: %lx\n",
+ 					phys_base);
++		} else {
++			machdep->machspec->phys_base = phys_base;
++			if (!x86_64_virt_phys_base())
++				error(WARNING, 
++				    "cannot determine physical base address:"
++				    " defaulting to %lx\n\n", 
++					phys_base);
+ 		}
+ 		return;
+ 	}
+@@ -5367,17 +5374,17 @@ x86_64_calc_phys_base(void)
+ 		}
+ 
+ 		if (xd->xc_core.header.xch_magic == XC_CORE_MAGIC_HVM)
+-			x86_64_xendump_phys_base();
++			x86_64_virt_phys_base();
+ 	}
+ }
+ 
+ /*
+- *  Because the xendump phys_base calculation is so speculative,
+- *  first verify and then possibly override it by trying to read
+- *  linux_banner from a range of typical physical offsets.
++ *  Verify, or possibly override, the xendump/kvmdump phys_base 
++ *  calculation by trying to read linux_banner from a range of 
++ *  typical physical offsets.
+  */
+-static void
+-x86_64_xendump_phys_base(void)
++static int
++x86_64_virt_phys_base(void)
+ {
+ 	char buf[BUFSIZE];
+ 	struct syment *sp;
+@@ -5385,29 +5392,31 @@ x86_64_xendump_phys_base(void)
+ 
+ 	if (!(sp = symbol_search("linux_banner")) ||
+ 	    !((sp->type == 'R') || (sp->type == 'r')))
+-		return;
++		return FALSE;
+ 
+ 	linux_banner_phys = sp->value - __START_KERNEL_map;
+ 
+ 	if (readmem(linux_banner_phys + machdep->machspec->phys_base,
+-	    PHYSADDR, buf, strlen("Linux version"), "xendump linux_banner", 
++	    PHYSADDR, buf, strlen("Linux version"), "linux_banner verify", 
+ 	    QUIET|RETURN_ON_ERROR) && STRNEQ(buf, "Linux version"))
+-		return;
++		return TRUE;
+ 
+ 	for (phys = (ulong)(-MEGABYTES(16)); phys != MEGABYTES(16+1); 
+ 	     phys += MEGABYTES(1)) {
+ 		if (readmem(linux_banner_phys + phys, PHYSADDR, buf,
+-		    strlen("Linux version"), "xendump linux_banner", 
++		    strlen("Linux version"), "linux_banner search", 
+ 		    QUIET|RETURN_ON_ERROR) && STRNEQ(buf, "Linux version")) {
+ 			if (CRASHDEBUG(1))
+ 				fprintf(fp,
+-				    "xendump phys_base: %lx %s\n", phys, 
++				    "virtual dump phys_base: %lx %s\n", phys, 
+ 					machdep->machspec->phys_base != phys ?
+ 					"override" : "");
+ 			machdep->machspec->phys_base = phys;
+-			return;
++			return TRUE;
+ 		}
+ 	}
++
++	return FALSE;
+ }
+ 
+ /*
+--- crash-5.0.0/kvmdump.h.orig
++++ crash-5.0.0/kvmdump.h
+@@ -57,6 +57,7 @@ struct kvmdump_data {
+ #define MAPFILE           (0x4)
+ #define MAPFILE_FOUND     (0x8)
+ #define MAPFILE_APPENDED (0x10)
++#define NO_PHYS_BASE     (0x20)
+ 
+ extern struct kvmdump_data *kvm;
+ 
+--- crash-5.0.0/qemu-load.c.orig
++++ crash-5.0.0/qemu-load.c
+@@ -223,6 +223,7 @@ ram_load (struct qemu_device *d, FILE *f
+ 	char name[257];
+ 	struct qemu_device_ram *dram = (struct qemu_device_ram *)d;
+ 	uint64_t header;
++	static int pc_ram = 0;
+ 
+ 	for (;;) {
+ 		uint64_t addr;
+@@ -245,19 +246,25 @@ ram_load (struct qemu_device *d, FILE *f
+ 			continue;
+ 		}
+ 
+-		if (d->version_id >= 4 && !(header & RAM_SAVE_FLAG_CONTINUE)
+-		    && !(header & RAM_SAVE_FLAG_EOS))
++		if (d->version_id >= 4 && !(header & RAM_SAVE_FLAG_CONTINUE)) {
+ 			get_string(fp, name);
++			if (strcmp(name, "pc.ram") == 0)
++				pc_ram = 1;
++			else
++				pc_ram = 0;
++		}
+ 
+ 		if (header & RAM_SAVE_FLAG_COMPRESS) {
+-//			dram->offsets[addr / 4096] =
+ 			entry = RAM_OFFSET_COMPRESSED | getc(fp);
+-			store_mapfile_offset(addr, &entry);
++			if ((d->version_id == 3) || 
++			    (d->version_id >= 4 && pc_ram))
++				store_mapfile_offset(addr, &entry);
+ 		}
+ 		else if (header & RAM_SAVE_FLAG_PAGE) {
+-//			dram->offsets[addr / 4096] = ftell (fp);
+ 			entry = ftell(fp);
+-			store_mapfile_offset(addr, &entry);
++			if ((d->version_id == 3) || 
++			    (d->version_id >= 4 && pc_ram))
++				store_mapfile_offset(addr, &entry);
+ 			fseek (fp, 4096, SEEK_CUR);
+ 		}
+ 	}
+--- crash-5.0.0/qemu.c.orig
++++ crash-5.0.0/qemu.c
+@@ -233,10 +233,10 @@ get_kernel_base(struct qemu_device_list 
+ 		 */
+                 kernel_base -= (base_vaddr - kvm->kvbase);
+         } else {
+-		fprintf(stderr, 
+-			"WARNING: cannot determine physical base address:"
++		dprintf("WARNING: cannot determine physical base address:"
+ 			" defaulting to 0\n\n");
+ 		kernel_base = 0;
++		kvm->flags |= NO_PHYS_BASE;
+ 	}
+ 
+ 	return kernel_base;
+--- crash-5.0.0/kvmdump.c.orig
++++ crash-5.0.0/kvmdump.c
+@@ -228,6 +228,8 @@ kvmdump_memory_dump(FILE *ofp)
+ 		fprintf(ofp, "%sMAPFILE_FOUND", others++ ? "|" : "");
+ 	if (kvm->flags & MAPFILE_APPENDED)
+ 		fprintf(ofp, "%sMAPFILE_APPENDED", others++ ? "|" : "");
++	if (kvm->flags & NO_PHYS_BASE)
++		fprintf(ofp, "%sNO_PHYS_BASE", others++ ? "|" : "");
+ 	fprintf(ofp, ")\n");
+ 
+ 	fprintf(ofp, "            mapfd: %d\n", kvm->mapfd);
+@@ -328,7 +330,8 @@ kvmdump_phys_base(unsigned long *phys_ba
+ 				kvm->mapinfo.cpu_version_id);
+ 
+                 *phys_base = kvm->mapinfo.phys_base;
+-                return TRUE;
++
++		return (kvm->flags & NO_PHYS_BASE ? FALSE : TRUE);
+         }
+ 
+         return FALSE;
+@@ -432,6 +435,12 @@ store_mapfile_offset(uint64_t physaddr, 
+ int 
+ load_mapfile_offset(uint64_t physaddr, off_t *entry_ptr)
+ {
++	if (physaddr >= 0xe0000000) {
++		if (physaddr < 0x100000000)
++			return SEEK_ERROR;   /* In 512MB I/O hole */
++		physaddr -= 0x20000000;
++	}
++ 
+         if (lseek(kvm->mapfd, mapfile_offset(physaddr), SEEK_SET) < 0) {
+ 		error(INFO, "load_memfile_offset: lseek: %s\n", 
+ 			strerror(errno));

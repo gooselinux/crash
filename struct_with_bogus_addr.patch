@@ -1,0 +1,20 @@
+--- crash-5.0.0/symbols.c.orig
++++ crash-5.0.0/symbols.c
+@@ -5403,7 +5403,7 @@ print_struct(char *s, ulong addr)
+ 	else
+         	sprintf(buf, "output *(struct %s *)0x%lx", s, addr);
+ 	fprintf(fp, "struct %s ", s);
+-        gdb_pass_through(buf, NULL, 0);
++	gdb_pass_through(buf, NULL, GNU_RETURN_ON_ERROR);
+ 	fprintf(fp, "\n");
+ }
+ 
+@@ -5421,7 +5421,7 @@ print_union(char *s, ulong addr)
+         else 
+         	sprintf(buf, "output *(union %s *)0x%lx", s, addr);
+         fprintf(fp, "union %s ", s);
+-        gdb_pass_through(buf, NULL, 0);
++        gdb_pass_through(buf, NULL, GNU_RETURN_ON_ERROR);
+ }
+ 
+ /*

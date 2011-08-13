@@ -1,0 +1,21 @@
+--- crash-5.0.4/gdb_interface.c.orig
++++ crash-5.0.4/gdb_interface.c
+@@ -786,6 +786,7 @@ int 
+ gdb_readmem_callback(ulong addr, void *buf, int len, int write)
+ { 
+ 	char locbuf[SIZEOF_32BIT], *p1;
++	uint32_t *p2;
+ 	int memtype;
+ 
+ 	if (write)
+@@ -830,8 +831,8 @@ gdb_readmem_callback(ulong addr, void *b
+ 		if (readmem(addr, memtype, locbuf, SIZEOF_32BIT,
+                     "gdb_readmem_callback", RETURN_ON_ERROR)) {
+ 			*p1 = locbuf[0];
+-			text_value_cache(addr, 
+-				(uint32_t)*((uint32_t *)locbuf), 0);
++			p2 = (uint32_t *)locbuf;
++			text_value_cache(addr, *p2, 0);
+ 			return TRUE;
+ 		}
+ 		break;

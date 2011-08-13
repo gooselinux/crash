@@ -1,0 +1,19 @@
+--- crash-5.0.0/kernel.c.orig
++++ crash-5.0.0/kernel.c
+@@ -5003,10 +5003,12 @@ do_linked_action:
+                         "irqaction flags", FAULT_ON_ERROR);
+                 fprintf(fp, "            flags: %lx\n", value);
+ 
+-                readmem(action+OFFSET(irqaction_mask), KVADDR,
+-                        &tmp1, sizeof(void *),
+-                        "irqaction mask", FAULT_ON_ERROR);
+-                fprintf(fp, "             mask: %lx\n", tmp1);
++		if (VALID_MEMBER(irqaction_mask)) {
++			readmem(action+OFFSET(irqaction_mask), KVADDR,
++				&tmp1, sizeof(void *),
++				"irqaction mask", FAULT_ON_ERROR);
++			fprintf(fp, "             mask: %lx\n", tmp1);
++		}
+ 
+                 readmem(action+OFFSET(irqaction_name), KVADDR,
+                         &tmp1, sizeof(void *),

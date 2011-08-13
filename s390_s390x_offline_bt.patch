@@ -1,0 +1,389 @@
+--- crash-5.0.0/defs.h.orig
++++ crash-5.0.0/defs.h
+@@ -1,8 +1,8 @@
+ /* defs.h - core analysis suite
+  *
+  * Copyright (C) 1999, 2000, 2001, 2002 Mission Critical Linux, Inc.
+- * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009 David Anderson
+- * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009 Red Hat, Inc. All rights reserved.
++ * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010 David Anderson
++ * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010 Red Hat, Inc. All rights reserved.
+  * Copyright (C) 2002 Silicon Graphics, Inc.
+  *
+  * This program is free software; you can redistribute it and/or modify
+@@ -1495,6 +1495,7 @@ struct offset_table {                   
+ 	long module_sect_attr_attr;
+ 	long module_sections_attrs;
+ 	long swap_info_struct_inuse_pages;
++	long s390_lowcore_psw_save_area;
+ };
+ 
+ struct size_table {         /* stash of commonly-used sizes */
+--- crash-5.0.0/s390x.c.orig
++++ crash-5.0.0/s390x.c
+@@ -3,7 +3,7 @@
+  * Copyright (C) 2001, 2002 Mission Critical Linux, Inc.
+  * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2009, 2010 David Anderson
+  * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2009, 2010 Red Hat, Inc. All rights reserved.
+- * Copyright (C) 2005, 2006 Michael Holzheu, IBM Corporation
++ * Copyright (C) 2005, 2006, 2010 Michael Holzheu, IBM Corporation
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -65,6 +65,20 @@ static void s390x_dump_line_number(ulong
+ static struct line_number_hook s390x_line_number_hooks[];
+ static int s390x_is_uvaddr(ulong, struct task_context *);
+ 
++ 
++/*
++ * Initialize member offsets
++ */
++static void s390x_offsets_init(void)
++{
++	if (MEMBER_EXISTS("_lowcore", "st_status_fixed_logout"))
++		MEMBER_OFFSET_INIT(s390_lowcore_psw_save_area, "_lowcore",
++				   "st_status_fixed_logout");
++	else
++		MEMBER_OFFSET_INIT(s390_lowcore_psw_save_area, "_lowcore",
++				   "psw_save_area");
++}
++
+ 
+ /*
+  *  Do all necessary machine-specific setup here.  This is called several
+@@ -130,6 +144,7 @@ s390x_init(int when)
+ 			machdep->hz = HZ;
+ 		machdep->section_size_bits = _SECTION_SIZE_BITS;
+ 		machdep->max_physmem_bits = _MAX_PHYSMEM_BITS;
++		s390x_offsets_init();
+ 		break;
+ 
+ 	case POST_INIT:
+@@ -539,46 +554,17 @@ s390x_cpu_of_task(unsigned long task)
+ }
+ 
+ /*
+- * returns true, if task currently is executed by a cpu
++ * returns true, if task of bt currently is executed by a cpu
+  */ 
+ static int 
+-s390x_has_cpu(unsigned long task)
++s390x_has_cpu(struct bt_info *bt)
+ {
+-	if(VALID_MEMBER(task_struct_cpus_runnable)){
+-		/* Linux 2.4 */
+-		unsigned long cpus_runnable;
+-		readmem(task+OFFSET(task_struct_cpus_runnable),KVADDR,
+-			&cpus_runnable,sizeof(cpus_runnable),
+-			"cpus_runnable", FAULT_ON_ERROR);
+-		if(cpus_runnable != ~0ULL)
+-			return TRUE;
+-		else
+-			return FALSE;
+-	} else {
+-		/* Linux 2.6 */
+-		unsigned long runqueue_addr, runqueue_offset;
+-		unsigned long cpu_offset, per_cpu_offset_addr, running_task;
+-		char *runqueue;
+-		int cpu;
+-
+-		cpu = s390x_cpu_of_task(task);
+-		runqueue = GETBUF(SIZE(runqueue));
+-
+-		runqueue_offset=symbol_value("per_cpu__runqueues");
+-		per_cpu_offset_addr=symbol_value("__per_cpu_offset");
+-		readmem(per_cpu_offset_addr + cpu * sizeof(long),KVADDR,
+-			&cpu_offset, sizeof(long),"per_cpu_offset",
+-			FAULT_ON_ERROR);
+-		runqueue_addr=runqueue_offset + cpu_offset;
+-		readmem(runqueue_addr,KVADDR,runqueue,SIZE(runqueue),
+-			"runqueue", FAULT_ON_ERROR);
+-		running_task = ULONG(runqueue + OFFSET(runqueue_curr));
+-		FREEBUF(runqueue);
+-		if(running_task == task)
+-			return TRUE; 
+-		else
+-			return FALSE;
+-	}
++	int cpu = bt->tc->processor;
++
++	if (is_task_active(bt->task) && (kt->cpu_flags[cpu] & ONLINE))
++		return TRUE;
++	else
++		return FALSE;
+ }
+ 
+ /*
+@@ -632,7 +618,7 @@ s390x_back_trace_cmd(struct bt_info *bt)
+ 	ksp = bt->stkptr;
+ 
+ 	/* print lowcore and get async stack when task has cpu */
+-	if(s390x_has_cpu(bt->task)){
++	if(s390x_has_cpu(bt)){
+ 		char lowcore[LOWCORE_SIZE];
+ 		unsigned long psw_flags;
+ 		int cpu = s390x_cpu_of_task(bt->task);
+@@ -642,8 +628,8 @@ s390x_back_trace_cmd(struct bt_info *bt)
+ 			return;
+ 		}
+ 		s390x_get_lowcore(cpu,lowcore);
+-		psw_flags = ULONG(lowcore + MEMBER_OFFSET("_lowcore",
+-			    "st_status_fixed_logout"));
++		psw_flags = ULONG(lowcore + OFFSET(s390_lowcore_psw_save_area));
++
+ 		if(psw_flags & 0x1000000000000ULL){
+ 			fprintf(fp,"Task runs in userspace\n");
+ 			s390x_print_lowcore(lowcore,bt,0);
+@@ -685,7 +671,7 @@ s390x_back_trace_cmd(struct bt_info *bt)
+ 			stack = bt->stackbuf;
+ 			stack_base = stack_start;
+ 		} else if((backchain > async_start) && (backchain < async_end)
+-			  && s390x_has_cpu(bt->task)){
++			  && s390x_has_cpu(bt)){
+ 			stack = async_stack;
+ 			stack_base = async_start;
+ 		} else {
+@@ -766,7 +752,7 @@ s390x_print_lowcore(char* lc, struct bt_
+ 	char* ptr;
+ 	unsigned long tmp[4];
+ 
+-	ptr = lc + MEMBER_OFFSET("_lowcore","st_status_fixed_logout");
++	ptr = lc + OFFSET(s390_lowcore_psw_save_area);
+ 	tmp[0]=ULONG(ptr);
+ 	tmp[1]=ULONG(ptr + S390X_WORD_SIZE);
+ 
+@@ -921,12 +907,12 @@ s390x_get_stack_frame(struct bt_info *bt
+ 	int r14_offset;
+ 	char lowcore[LOWCORE_SIZE];
+ 
+-	if(s390x_has_cpu(bt->task))
++	if(s390x_has_cpu(bt))
+ 		s390x_get_lowcore(s390x_cpu_of_task(bt->task),lowcore);
+ 
+ 	/* get the stack pointer */
+ 	if(esp){
+-		if(s390x_has_cpu(bt->task)){
++		if(s390x_has_cpu(bt)){
+ 			ksp = ULONG(lowcore + MEMBER_OFFSET("_lowcore",
+ 				"gpregs_save_area") + (15 * S390X_WORD_SIZE));
+ 		} else {
+@@ -944,9 +930,9 @@ s390x_get_stack_frame(struct bt_info *bt
+ 	if(!eip)
+ 		return;
+ 
+-	if(s390x_has_cpu(bt->task) && esp){
+-		*eip = ULONG(lowcore + MEMBER_OFFSET("_lowcore",
+-		       "st_status_fixed_logout") + S390X_WORD_SIZE);
++	if(s390x_has_cpu(bt) && esp){
++		*eip = ULONG(lowcore + OFFSET(s390_lowcore_psw_save_area) +
++			S390X_WORD_SIZE);
+ 	} else {
+ 		if(!STRUCT_EXISTS("stack_frame")){
+ 			r14_offset = 112;
+--- crash-5.0.0/s390.c.orig
++++ crash-5.0.0/s390.c
+@@ -3,7 +3,7 @@
+  * Copyright (C) 2001, 2002 Mission Critical Linux, Inc.
+  * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2009, 2010 David Anderson
+  * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2009, 2010 Red Hat, Inc. All rights reserved.
+- * Copyright (C) 2005, 2006 Michael Holzheu, IBM Corporation
++ * Copyright (C) 2005, 2006, 2010 Michael Holzheu, IBM Corporation
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -67,6 +67,18 @@ static void s390_dump_line_number(ulong)
+ static struct line_number_hook s390_line_number_hooks[];
+ static int s390_is_uvaddr(ulong, struct task_context *);
+ 
++/*
++ * Initialize member offsets
++ */
++static void s390_offsets_init(void)
++{
++	if (MEMBER_EXISTS("_lowcore", "st_status_fixed_logout"))
++		MEMBER_OFFSET_INIT(s390_lowcore_psw_save_area, "_lowcore",
++				   "st_status_fixed_logout");
++	else
++		MEMBER_OFFSET_INIT(s390_lowcore_psw_save_area, "_lowcore",
++				   "psw_save_area");
++}
+ 
+ /*
+  *  Do all necessary machine-specific setup here.  This is called several
+@@ -132,6 +144,7 @@ s390_init(int when)
+ 			machdep->hz = HZ;
+ 		machdep->section_size_bits = _SECTION_SIZE_BITS;
+ 		machdep->max_physmem_bits = _MAX_PHYSMEM_BITS;
++		s390_offsets_init();
+ 		break;
+ 
+ 	case POST_INIT:
+@@ -529,46 +542,17 @@ s390_cpu_of_task(unsigned long task)
+ }
+ 
+ /*
+- * returns true, if task currently is executed by a cpu
++ * returns true, if task of bt currently is executed by a cpu
+  */ 
+ static int 
+-s390_has_cpu(unsigned long task)
++s390_has_cpu(struct bt_info *bt)
+ {
+-	if(VALID_MEMBER(task_struct_cpus_runnable)){
+-                /* Linux 2.4 */
+-                unsigned long cpus_runnable;
+-                readmem(task+OFFSET(task_struct_cpus_runnable),KVADDR,
+-                        &cpus_runnable,sizeof(cpus_runnable),
+-                        "cpus_runnable", FAULT_ON_ERROR);
+-                if(cpus_runnable != ~0U)
+-                        return TRUE;
+-                else
+-                        return FALSE;
+-        } else {
+-		/* Linux 2.6 */
+-		unsigned long runqueue_addr, runqueue_offset;
+-		unsigned long cpu_offset, per_cpu_offset_addr, running_task;
+-		char *runqueue;
+-		int cpu;
+-
+-		cpu = s390_cpu_of_task(task);
+-		runqueue = GETBUF(SIZE(runqueue));
+-
+-		runqueue_offset=symbol_value("per_cpu__runqueues");
+-		per_cpu_offset_addr=symbol_value("__per_cpu_offset");
+-		readmem(per_cpu_offset_addr + cpu * sizeof(long),KVADDR,
+-			&cpu_offset, sizeof(long),"per_cpu_offset",
+-			FAULT_ON_ERROR);
+-		runqueue_addr=runqueue_offset + cpu_offset;
+-		readmem(runqueue_addr,KVADDR,runqueue,SIZE(runqueue),
+-			"runqueue", FAULT_ON_ERROR);
+-		running_task = ULONG(runqueue + OFFSET(runqueue_curr));
+-		FREEBUF(runqueue);
+-		if(running_task == task)
+-			return TRUE;
+-		else
+-			return FALSE;
+-	}
++	int cpu = bt->tc->processor;
++
++	if (is_task_active(bt->task) && (kt->cpu_flags[cpu] & ONLINE))
++		return TRUE;
++	else
++		return FALSE;
+ }
+ 
+ /*
+@@ -622,7 +606,7 @@ s390_back_trace_cmd(struct bt_info *bt)
+ 	ksp = bt->stkptr;
+ 
+ 	/* print lowcore and get async stack when task has cpu */
+-	if(s390_has_cpu(bt->task)){
++	if(s390_has_cpu(bt)){
+ 		char lowcore[LOWCORE_SIZE];
+ 		unsigned long psw_flags;
+ 		int cpu = s390_cpu_of_task(bt->task);
+@@ -632,8 +616,7 @@ s390_back_trace_cmd(struct bt_info *bt)
+ 			return;
+ 		}
+ 		s390_get_lowcore(cpu,lowcore);
+-		psw_flags = ULONG(lowcore + MEMBER_OFFSET("_lowcore",
+-			    "st_status_fixed_logout"));
++		psw_flags = ULONG(lowcore + OFFSET(s390_lowcore_psw_save_area));
+ 		if(psw_flags & 0x10000UL){
+ 				fprintf(fp,"Task runs in userspace\n");
+ 				s390_print_lowcore(lowcore,bt,0);
+@@ -675,7 +658,7 @@ s390_back_trace_cmd(struct bt_info *bt)
+ 			stack = bt->stackbuf;
+ 			stack_base = stack_start;
+ 		} else if((backchain > async_start) && (backchain < async_end)
+-			  && s390_has_cpu(bt->task)){
++			  && s390_has_cpu(bt)){
+ 			stack = async_stack;
+ 			stack_base = async_start;
+ 		} else {
+@@ -755,7 +738,7 @@ s390_print_lowcore(char* lc, struct bt_i
+ 	char* ptr;
+ 	unsigned long tmp[4];
+ 
+-	ptr = lc + MEMBER_OFFSET("_lowcore","st_status_fixed_logout");
++	ptr = lc + OFFSET(s390_lowcore_psw_save_area);
+ 	tmp[0]=ULONG(ptr);
+ 	tmp[1]=ULONG(ptr + S390_WORD_SIZE);
+ 
+@@ -891,12 +874,12 @@ s390_get_stack_frame(struct bt_info *bt,
+ 	int r14_offset;
+ 	char lowcore[LOWCORE_SIZE];
+ 
+-	if(s390_has_cpu(bt->task))
++	if(s390_has_cpu(bt))
+ 		s390_get_lowcore(s390_cpu_of_task(bt->task),lowcore);
+ 
+ 	/* get the stack pointer */
+ 	if(esp){
+-		if(s390_has_cpu(bt->task)){
++		if(s390_has_cpu(bt)){
+ 			ksp = ULONG(lowcore + MEMBER_OFFSET("_lowcore",
+ 				"gpregs_save_area") + (15 * S390_WORD_SIZE));
+ 		} else {
+@@ -914,10 +897,9 @@ s390_get_stack_frame(struct bt_info *bt,
+ 	if(!eip)
+ 		return;
+ 
+-	if(s390_has_cpu(bt->task) && esp){
+-		*eip = ULONG(lowcore + MEMBER_OFFSET("_lowcore",
+-		       "st_status_fixed_logout") + S390_WORD_SIZE)
+-       		       & S390_ADDR_MASK;
++	if(s390_has_cpu(bt) && esp){
++		*eip = ULONG(lowcore + OFFSET(s390_lowcore_psw_save_area) +
++			S390_WORD_SIZE) & S390_ADDR_MASK;
+ 	} else {
+ 		if(!STRUCT_EXISTS("stack_frame")){
+ 			r14_offset = 56;
+--- crash-5.0.0/symbols.c.orig
++++ crash-5.0.0/symbols.c
+@@ -1,8 +1,8 @@
+ /* symbols.c - core analysis suite
+  *
+  * Copyright (C) 1999, 2000, 2001, 2002 Mission Critical Linux, Inc.
+- * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009 David Anderson
+- * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009 Red Hat, Inc. All rights reserved.
++ * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010 David Anderson
++ * Copyright (C) 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010 Red Hat, Inc. All rights reserved.
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+@@ -1762,9 +1762,25 @@ store_module_kallsyms_v2(struct load_mod
+ 		nksyms = UINT(modbuf + OFFSET(module_num_symtab));
+ 	else
+ 		nksyms = ULONG(modbuf + OFFSET(module_num_symtab));
++
+ 	ksymtab = ULONG(modbuf + OFFSET(module_symtab));
++	if (!IN_MODULE(ksymtab, lm)) {
++		error(WARNING,
++		    "%s: module.symtab outside of module address space\n",
++			lm->mod_name);
++		FREEBUF(module_buf);
++		return 0;
++	} 
+ 	locsymtab = module_buf + (ksymtab - lm->mod_base);
++
+ 	kstrtab = ULONG(modbuf + OFFSET(module_strtab));
++	if (!IN_MODULE(kstrtab, lm)) {
++		error(WARNING, 
++		    "%s: module.strtab outside of module address space\n",
++			lm->mod_name);
++		FREEBUF(module_buf);
++		return 0;
++	}
+ 	locstrtab = module_buf + (kstrtab - lm->mod_base);
+ 
+ 	for (i = 1; i < nksyms; i++) {  /* ELF starts real symbols at 1 */
+@@ -7305,6 +7321,8 @@ dump_offset_table(char *spec, ulong make
+ 		OFFSET(pcpu_info_idle));
+ 	fprintf(fp, "                vcpu_struct_rq: %ld\n",
+ 		OFFSET(vcpu_struct_rq));
++	fprintf(fp, "    s390_lowcore_psw_save_area: %ld\n",
++		OFFSET(s390_lowcore_psw_save_area));
+ 
+ 	fprintf(fp, "\n                    size_table:\n");
+ 	fprintf(fp, "                          page: %ld\n", SIZE(page));
